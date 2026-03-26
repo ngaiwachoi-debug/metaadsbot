@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 # How many newest posts to consider per actor/page.
 POSTS_PER_PAGE = 5
 HTTP_TIMEOUT = 60.0
+
 
 def load_local_config() -> tuple[dict[str, str], dict[str, dict]]:
     """Load SHOP_NAME_MAP + SHOP_CONFIGS from local config.json."""
@@ -63,6 +65,68 @@ def _norm_story_key(s: str) -> str:
     return str(s or "").strip()
 
 
+def _parse_meta_error(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+    except Exception:
+        return {"message": resp.text[:500], "type": "unknown", "code": "", "error_subcode": ""}
+    err = payload.get("error", payload if isinstance(payload, dict) else {})
+    if not isinstance(err, dict):
+        err = {}
+    return {
+        "message": str(err.get("message", "")),
+        "type": str(err.get("type", "")),
+        "code": err.get("code", ""),
+        "error_subcode": err.get("error_subcode", ""),
+    }
+
+
+def _print_meta_error(prefix: str, resp: httpx.Response) -> dict[str, Any]:
+    err = _parse_meta_error(resp)
+    print(
+        f"❌ Meta API 錯誤 [代碼: {err['code']}][子代碼: {err['error_subcode']}]: {err['message']} "
+        f"(type={err['type']}, http={resp.status_code}, scope={prefix})"
+    )
+    return err
+
+
+def _should_try_media_fallback(err: dict[str, Any]) -> bool:
+    msg = str(err.get("message", "")).lower()
+    return (
+        "object does not exist" in msg
+        or "unsupported get request" in msg
+        or "does not support this operation" in msg
+        or "unknown path components" in msg
+        or "object with id" in msg
+    )
+
+
+def debug_token_scopes(client: httpx.Client) -> None:
+    """
+    Print token scopes to quickly diagnose missing permissions.
+    Note: debug_token traditionally expects app access token; we still probe with current token
+    for transparent diagnostics.
+    """
+    url = f"https://graph.facebook.com/{API_VERSION}/debug_token"
+    params = {
+        "input_token": ACCESS_TOKEN,
+        "access_token": ACCESS_TOKEN,
+    }
+    r = client.get(url, params=params, timeout=HTTP_TIMEOUT)
+    if r.status_code != 200:
+        _print_meta_error("debug_token", r)
+        return
+    try:
+        data = (r.json() or {}).get("data", {})
+    except Exception:
+        print("⚠️ debug_token 回應無法解析。")
+        return
+    scopes = data.get("scopes") or []
+    if not isinstance(scopes, list):
+        scopes = []
+    print(f"🔐 Token Scopes ({len(scopes)}): {', '.join(str(x) for x in scopes) if scopes else '(empty)'}")
+
+
 def fetch_all_promoted_story_ids(client: httpx.Client) -> set[str]:
     """Collect effective_object_story_id from all ads in the account."""
     promoted: set[str] = set()
@@ -78,7 +142,7 @@ def fetch_all_promoted_story_ids(client: httpx.Client) -> set[str]:
         r = client.get(url, params=params if first_page else None, timeout=HTTP_TIMEOUT)
         first_page = False
         if r.status_code != 200:
-            print(f"⚠️ ads list HTTP {r.status_code}: {r.text[:500]}")
+            _print_meta_error("ads/effective_object_story_id", r)
             break
         data = r.json()
         for ad in data.get("data", []) or []:
@@ -95,8 +159,9 @@ def fetch_all_promoted_story_ids(client: httpx.Client) -> set[str]:
     return promoted
 
 
-def fetch_actor_posts(client: httpx.Client, actor_id: str) -> list[dict]:
-    url = f"https://graph.facebook.com/{API_VERSION}/{actor_id}/posts"
+def _fetch_node_feed(client: httpx.Client, actor_id: str, edge: str) -> tuple[list[dict], bool]:
+    """Returns (data, ok)."""
+    url = f"https://graph.facebook.com/{API_VERSION}/{actor_id}/{edge}"
     params = {
         "fields": "id,created_time,message",
         "limit": POSTS_PER_PAGE,
@@ -104,14 +169,33 @@ def fetch_actor_posts(client: httpx.Client, actor_id: str) -> list[dict]:
     }
     r = client.get(url, params=params, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
-        # OAuth / permission errors should be skipped without stopping the script.
+        err = _print_meta_error(f"{actor_id}/{edge}", r)
+        # Permission / oauth wall: skip this actor without raising.
         if r.status_code in (400, 401, 403):
-            print(f"⚠️ actor_id={actor_id} 權限不足或 OAuth 錯誤，已略過。HTTP {r.status_code}")
-        else:
-            print(f"⚠️ actor_id={actor_id} posts HTTP {r.status_code}: {r.text[:400]}")
-        return []
+            return [], False
+        if _should_try_media_fallback(err):
+            return [], False
+        return [], False
     data = r.json()
-    return list(data.get("data", []) or [])
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    return (list(rows) if isinstance(rows, list) else []), True
+
+
+def fetch_actor_posts(client: httpx.Client, actor_id: str) -> list[dict]:
+    # Primary: Facebook page-style posts
+    posts, ok = _fetch_node_feed(client, actor_id, "posts")
+    if ok and posts:
+        return posts
+    if ok and not posts:
+        return []
+
+    # Fallback: Instagram business/media style
+    media, ok2 = _fetch_node_feed(client, actor_id, "media")
+    if ok2:
+        if media:
+            print(f"ℹ️ actor_id={actor_id} 使用 /media fallback 成功。")
+        return media
+    return []
 
 
 def _post_is_promoted(post_id: str, promoted: set[str]) -> bool:
@@ -163,12 +247,15 @@ def run() -> list[dict]:
 
     pending: list[dict] = []
 
-    with httpx.Client() as client:
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    with httpx.Client(limits=limits) as client:
+        debug_token_scopes(client)
         promoted = fetch_all_promoted_story_ids(client)
         print(f"📌 帳戶內已收集 promoted story id 約 {len(promoted)} 筆（去重後）。")
 
         for shop in sorted(configs.keys()):
             actor_ids = get_actor_ids_for_shop(shop, name_map)
+            print(f"🏪 掃描店鋪：{shop} | actor_ids={actor_ids}")
             if not actor_ids:
                 print(f"⚠️ 店鋪「{shop}」在 SHOP_NAME_MAP 無對應 actor/page id，略過。")
                 continue
