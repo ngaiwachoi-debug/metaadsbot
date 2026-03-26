@@ -1,0 +1,9 @@
+.env
+credentials.json
+*.pyc
+__pycache__/
+node_modules/
+.DS_Store
+pending_tests.json
+meta_interests_lib.json
+.cursor/

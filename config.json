@@ -1,0 +1,31 @@
+{
+    "SHOP_NAME_MAP": {
+      "938493152688096": "Lounge & Skin 尖沙嘴",
+      "917547361453249": "Lounge & Skin 尖沙嘴",
+      "923839340819920": "Lounge & Skin 尖沙嘴",
+      "998949179974860": "OLase 金帝行店",
+      "110713156958120": "OLASE 銅鑼灣店",
+      "106885092205252": "OLASE 銅鑼灣店",
+      "101023398802050": "OLASE 銅鑼灣店",
+      "109170695132210": "OLASE 銅鑼灣店",
+      "645677431964443": "Olase 旺角店",
+      "376025488928222": "Natura Spa 中環",
+      "112331955168892": "Natura Spa 中環",
+      "279503425255840": "Natura 太子",
+      "617430892040751": "Natura 太子",
+      "744270078765428": "Natura 荃灣",
+      "566302223233442": "Natura 荃灣",
+      "533512276514917": "其他"
+    },
+    "SHOP_CONFIGS": {
+      "Olase 旺角店": {"total": 700, "bun_ratio": 0.0},
+      "Olase 柯士甸店": {"total": 700, "bun_ratio": 0.3},
+      "OLase 金帝行店": {"total": 700, "bun_ratio": 0.3},
+      "Natura Spa 中環": {"total": 700, "bun_ratio": 0.3},
+      "Natura 荃灣": {"total": 700, "bun_ratio": 0.3},
+      "Natura 太子": {"total": 350, "bun_ratio": 0.5},
+      "Lounge & Skin 尖沙嘴": {"total": 700, "bun_ratio": 0.3},
+      "OLASE 銅鑼灣店": {"total": 700, "bun_ratio": 0.3},
+      "其他": {"total": 500, "bun_ratio": 0.2}
+    }
+  }
