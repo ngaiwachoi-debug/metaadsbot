@@ -42,6 +42,14 @@ if sys.platform == "win32":
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _google_credentials_path() -> str:
+    p = (os.getenv("GOOGLE_CREDENTIALS_PATH") or "credentials.json").strip()
+    return p if os.path.isabs(p) else os.path.join(_ROOT, p)
+
+
 load_dotenv()
 SHEET_NAME = os.getenv("SHEET_NAME", "AdSurvivor_Report")
 RAW_SHEET_TAB = os.getenv("RAW_SHEET_TAB", "Sheet1")
@@ -90,11 +98,16 @@ REFINED_COLUMNS = [
 
 
 def get_google_sheet():
+    cred_path = _google_credentials_path()
+    if not os.path.isfile(cred_path):
+        print(f"❌ Google 憑證檔不存在: {cred_path}")
+        print("   請將 GCP 服務帳號 JSON 放到專案目錄並命名為 credentials.json，或在 .env 設定 GOOGLE_CREDENTIALS_PATH（可為絕對路徑）。")
+        sys.exit(1)
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
     client = gspread.authorize(creds)
     return client.open(SHEET_NAME)
 

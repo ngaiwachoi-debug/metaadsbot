@@ -1,4 +1,7 @@
-"""Shop name mapping from Facebook/IG display names to internal 店名 (from .env SHOP_NAME_MAP)."""
+"""Map Meta ad/page display strings and numeric Graph ids to internal 店名 (from .env SHOP_NAME_MAP).
+
+Internal 店名 is for reporting/SHOP_CONFIGS; it need not match the Page's public title on Facebook.
+"""
 
 from __future__ import annotations
 

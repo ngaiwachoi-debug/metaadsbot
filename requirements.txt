@@ -1,0 +1,10 @@
+# Direct third-party imports used by this repo:
+#   - httpx: callfrommeta.py, check_latest_posts.py
+#   - gspread: callfrommeta.py, ai_optimizer.py
+#   - oauth2client: callfrommeta.py, ai_optimizer.py (ServiceAccountCredentials)
+#   - python-dotenv: shop_mapping.py, engine.py, callfrommeta.py, ai_optimizer.py, check_latest_posts.py
+
+httpx>=0.28,<1
+gspread>=6.2,<7
+oauth2client>=4.1.3,<5
+python-dotenv>=1.0,<2

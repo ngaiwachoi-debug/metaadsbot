@@ -2,6 +2,9 @@
 Phase 4: For every shop in SHOP_CONFIGS, fetch Facebook Page posts and compare to
 promoted `effective_object_story_id` from the ad account. Writes pending_tests.json
 when a recent page post has no matching ad creative story id.
+
+專頁貼文必須使用「專頁 access_token」（由用戶 META_ACCESS_TOKEN 呼叫 /me/accounts 取得），
+不可直接用用戶 Token 呼叫 /{page-id}/posts。
 """
 from __future__ import annotations
 
@@ -26,39 +29,37 @@ API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v18.0").strip() or "v18.0"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.join(ROOT, "pending_tests.json")
-CONFIG_PATH = os.path.join(ROOT, "config.json")
 
 # How many newest posts to consider per actor/page.
 POSTS_PER_PAGE = 5
 HTTP_TIMEOUT = 60.0
 
 
-def load_local_config() -> tuple[dict[str, str], dict[str, dict]]:
-    """Load SHOP_NAME_MAP + SHOP_CONFIGS from local config.json."""
-    if not os.path.isfile(CONFIG_PATH):
-        print(f"⚠️ 找不到設定檔：{CONFIG_PATH}")
-        return {}, {}
+def _parse_json_env(name: str, default: Any) -> Any:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = json.load(f)
+        return json.loads(raw)
     except json.JSONDecodeError:
-        print(f"⚠️ 設定檔 JSON 格式錯誤：{CONFIG_PATH}")
-        return {}, {}
-    except Exception as e:
-        print(f"⚠️ 讀取設定檔失敗：{e}")
-        return {}, {}
+        print(f"⚠️ 環境變數 {name} 的 JSON 無法解析，使用預設。")
+        return default
 
-    if not isinstance(cfg, dict):
-        print(f"⚠️ 設定檔內容不是 JSON 物件：{CONFIG_PATH}")
-        return {}, {}
 
-    name_map = cfg.get("SHOP_NAME_MAP", {})
-    shop_configs = cfg.get("SHOP_CONFIGS", {})
+def load_local_config() -> tuple[dict[str, str], dict[str, dict]]:
+    """Load SHOP_NAME_MAP + SHOP_CONFIGS from .env (same as shop_mapping / engine)."""
+    name_map = _parse_json_env("SHOP_NAME_MAP", {})
+    shop_configs = _parse_json_env("SHOP_CONFIGS", {})
     if not isinstance(name_map, dict):
         name_map = {}
     if not isinstance(shop_configs, dict):
         shop_configs = {}
     return name_map, shop_configs
+
+
+def _is_numeric_graph_id(key: str) -> bool:
+    """Only numeric keys are valid {id}/posts Graph node ids for this script."""
+    return str(key or "").strip().isdigit()
 
 
 def _norm_story_key(s: str) -> str:
@@ -159,13 +160,49 @@ def fetch_all_promoted_story_ids(client: httpx.Client) -> set[str]:
     return promoted
 
 
-def _fetch_node_feed(client: httpx.Client, actor_id: str, edge: str) -> tuple[list[dict], bool]:
-    """Returns (data, ok)."""
+def fetch_page_access_tokens(client: httpx.Client) -> dict[str, str]:
+    """
+    以用戶 Token 呼叫 GET /me/accounts，取得所管理專頁的 id 與專頁專用 access_token。
+    回傳 page_id -> page_access_token（僅含 Facebook Page，不含 IG 使用者節點）。
+    """
+    mapping: dict[str, str] = {}
+    base = f"https://graph.facebook.com/{API_VERSION}/me/accounts"
+    params = {
+        "fields": "id,name,access_token",
+        "limit": 100,
+        "access_token": ACCESS_TOKEN,
+    }
+    url: str | None = base
+    first_page = True
+    while url:
+        r = client.get(url, params=params if first_page else None, timeout=HTTP_TIMEOUT)
+        first_page = False
+        if r.status_code != 200:
+            _print_meta_error("me/accounts", r)
+            break
+        data = r.json()
+        for row in data.get("data", []) or []:
+            if not isinstance(row, dict):
+                continue
+            pid = str(row.get("id") or "").strip()
+            tok = str(row.get("access_token") or "").strip()
+            if pid and tok:
+                mapping[pid] = tok
+        url = (data.get("paging") or {}).get("next")
+    return mapping
+
+
+def _fetch_node_feed(
+    client: httpx.Client, actor_id: str, edge: str, page_token: str
+) -> tuple[list[dict], bool]:
+    """Returns (data, ok). page_token must be the Page access token for this actor_id."""
+    if not page_token:
+        return [], False
     url = f"https://graph.facebook.com/{API_VERSION}/{actor_id}/{edge}"
     params = {
         "fields": "id,created_time,message",
         "limit": POSTS_PER_PAGE,
-        "access_token": ACCESS_TOKEN,
+        "access_token": page_token,
     }
     r = client.get(url, params=params, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
@@ -181,16 +218,19 @@ def _fetch_node_feed(client: httpx.Client, actor_id: str, edge: str) -> tuple[li
     return (list(rows) if isinstance(rows, list) else []), True
 
 
-def fetch_actor_posts(client: httpx.Client, actor_id: str) -> list[dict]:
+def fetch_actor_posts(client: httpx.Client, actor_id: str, page_token: str) -> list[dict]:
+    """Fetch recent posts (or IG /media fallback) using the Page-scoped token for this id."""
+    if not page_token:
+        return []
     # Primary: Facebook page-style posts
-    posts, ok = _fetch_node_feed(client, actor_id, "posts")
+    posts, ok = _fetch_node_feed(client, actor_id, "posts", page_token)
     if ok and posts:
         return posts
     if ok and not posts:
         return []
 
-    # Fallback: Instagram business/media style
-    media, ok2 = _fetch_node_feed(client, actor_id, "media")
+    # Fallback: Instagram business/media style (同樣帶入專頁 Token；若 actor 為純 IG id 可能仍失敗)
+    media, ok2 = _fetch_node_feed(client, actor_id, "media", page_token)
     if ok2:
         if media:
             print(f"ℹ️ actor_id={actor_id} 使用 /media fallback 成功。")
@@ -216,18 +256,19 @@ def _post_is_promoted(post_id: str, promoted: set[str]) -> bool:
 
 def get_actor_ids_for_shop(target_shop_name: str, shop_name_map: dict[str, str]) -> list[str]:
     """
-    Reverse lookup from SHOP_NAME_MAP:
-    keys are actor_ids, values are shop names.
+    Reverse lookup from SHOP_NAME_MAP: numeric keys are Graph page/IG ids;
+    values are internal 店名 (same labels as SHOP_CONFIGS keys), not necessarily the Page's public name.
     """
     target = str(target_shop_name or "").strip()
     out: list[str] = []
     if not target:
         return out
     for actor_id, mapped_shop in shop_name_map.items():
-        if str(mapped_shop or "").strip() == target:
-            aid = str(actor_id or "").strip()
-            if aid:
-                out.append(aid)
+        if str(mapped_shop or "").strip() != target:
+            continue
+        aid = str(actor_id or "").strip()
+        if aid and _is_numeric_graph_id(aid):
+            out.append(aid)
     return sorted(set(out))
 
 
@@ -250,6 +291,8 @@ def run() -> list[dict]:
     limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
     with httpx.Client(limits=limits) as client:
         debug_token_scopes(client)
+        page_tokens = fetch_page_access_tokens(client)
+        print(f"📋 /me/accounts：已載入 {len(page_tokens)} 個專頁 access_token。")
         promoted = fetch_all_promoted_story_ids(client)
         print(f"📌 帳戶內已收集 promoted story id 約 {len(promoted)} 筆（去重後）。")
 
@@ -261,7 +304,13 @@ def run() -> list[dict]:
                 continue
 
             for actor_id in actor_ids:
-                posts = fetch_actor_posts(client, actor_id)
+                page_token = page_tokens.get(actor_id)
+                if not page_token:
+                    print(
+                        f"⚠️ actor_id={actor_id} 在 /me/accounts 無對應專頁 Token（可能非目前用戶管理的 FB 專頁，或為 IG 帳號 id），略過。"
+                    )
+                    continue
+                posts = fetch_actor_posts(client, actor_id, page_token)
                 if not posts:
                     continue
                 posts.sort(key=lambda x: str(x.get("created_time", "")), reverse=True)

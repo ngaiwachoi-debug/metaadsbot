@@ -30,6 +30,15 @@ if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 load_dotenv()
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _google_credentials_path() -> str:
+    p = (os.getenv("GOOGLE_CREDENTIALS_PATH") or "credentials.json").strip()
+    return p if os.path.isabs(p) else os.path.join(_ROOT, p)
+
+
 ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 AD_ACCOUNT_ID = os.getenv("AD_ACCOUNT_ID")
 SHEET_NAME = os.getenv("SHEET_NAME", "AdSurvivor_Report")
@@ -41,8 +50,13 @@ ADS_PAGE_LIMIT = 100
 
 def get_raw_worksheet():
     try:
+        cred_path = _google_credentials_path()
+        if not os.path.isfile(cred_path):
+            print(f"❌ Google 憑證檔不存在: {cred_path}")
+            print("   請將 GCP 服務帳號 JSON 放到專案目錄並命名為 credentials.json，或在 .env 設定 GOOGLE_CREDENTIALS_PATH（可為絕對路徑）。")
+            sys.exit(1)
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scope)
         client = gspread.authorize(creds)
         ss = client.open(SHEET_NAME)
         try:
@@ -368,9 +382,8 @@ async def run_sync_process():
             sheet.update(range_name="A1", values=sheet_output)
             print(f"✅ Raw 同步完成！今日花費: {total_today:.2f} | 本月花費: {total_month:.2f}")
             print("🚀 檢查待測貼文 → AI_Optimizer...")
-            _root = os.path.dirname(os.path.abspath(__file__))
-            subprocess.run([sys.executable, "check_latest_posts.py"], cwd=_root)
-            subprocess.run([sys.executable, "ai_optimizer.py"], cwd=_root)
+            subprocess.run([sys.executable, "check_latest_posts.py"], cwd=_ROOT)
+            subprocess.run([sys.executable, "ai_optimizer.py"], cwd=_ROOT)
         except Exception as e:
             print(f"❌ Google Sheets 寫入失敗: {e}")
 
