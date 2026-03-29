@@ -1,3 +1,6 @@
+# Install once on your machine (system or user site-packages; no venv required):
+#   pip install -r requirements.txt
+#
 # Direct third-party imports used by this repo:
 #   - httpx: callfrommeta.py, check_latest_posts.py
 #   - gspread: callfrommeta.py, ai_optimizer.py
