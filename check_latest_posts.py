@@ -1,5 +1,5 @@
 """
-Phase 4: For every shop in SHOP_CONFIGS, fetch Facebook Page posts and compare to
+Phase 4: For every shop in config.json SHOP_CONFIGS (file only; ignores SHOP_CONFIGS .env), fetch Facebook Page posts and compare to
 promoted `effective_object_story_id` from the ad account. Writes pending_tests.json
 when a recent page post has no matching ad creative story id.
 
@@ -11,12 +11,16 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any
-
 import httpx
 from dotenv import load_dotenv
 
-from engine import classify_strategy, _pool_name
+from engine import (
+    classify_strategy,
+    new_ad_test_post_cap_for_shop,
+    new_ad_test_scan_per_page_for_shop,
+    shop_configs_from_config_json,
+    _pool_name,
+)
 from shop_mapping import SHOP_NAME_MAP
 
 if sys.platform == "win32":
@@ -33,28 +37,14 @@ API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v18.0").strip() or "v18.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.join(ROOT, "pending_tests.json")
 
-# How many newest posts to consider per actor/page.
-POSTS_PER_PAGE = 5
+# Default Graph fetch limit when env PENDING_POSTS_FETCH_LIMIT unset (must be >= scan window).
+_DEFAULT_FETCH_LIMIT = 10
 HTTP_TIMEOUT = 60.0
 
 
-def _parse_json_env(name: str, default: Any) -> Any:
-    raw = os.getenv(name, "")
-    if not raw:
-        return default
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"⚠️ 環境變數 {name} 的 JSON 無法解析，使用預設。")
-        return default
-
-
 def load_local_config() -> tuple[dict[str, str], dict[str, dict]]:
-    """SHOP_NAME_MAP from shop_mapping (file or env); SHOP_CONFIGS from .env JSON."""
-    shop_configs = _parse_json_env("SHOP_CONFIGS", {})
-    if not isinstance(shop_configs, dict):
-        shop_configs = {}
-    return SHOP_NAME_MAP, shop_configs
+    """SHOP_NAME_MAP from shop_mapping; SHOP_CONFIGS from config.json only (not SHOP_CONFIGS env)."""
+    return SHOP_NAME_MAP, shop_configs_from_config_json()
 
 
 def _is_numeric_graph_id(key: str) -> bool:
@@ -225,15 +215,20 @@ def fetch_managed_pages_directory(client: httpx.Client) -> dict[str, str]:
 
 
 def _fetch_node_feed(
-    client: httpx.Client, actor_id: str, edge: str, page_token: str
+    client: httpx.Client,
+    actor_id: str,
+    edge: str,
+    page_token: str,
+    fetch_limit: int,
 ) -> tuple[list[dict], bool]:
     """Returns (data, ok). page_token must be the Page access token for this actor_id."""
     if not page_token:
         return [], False
+    lim = max(1, int(fetch_limit))
     url = f"https://graph.facebook.com/{API_VERSION}/{actor_id}/{edge}"
     params = {
-        "fields": "id,created_time,message",
-        "limit": POSTS_PER_PAGE,
+        "fields": "id,created_time,message,full_picture",
+        "limit": lim,
         "access_token": page_token,
     }
     r = client.get(url, params=params, timeout=HTTP_TIMEOUT)
@@ -250,19 +245,21 @@ def _fetch_node_feed(
     return (list(rows) if isinstance(rows, list) else []), True
 
 
-def fetch_actor_posts(client: httpx.Client, actor_id: str, page_token: str) -> list[dict]:
+def fetch_actor_posts(
+    client: httpx.Client, actor_id: str, page_token: str, fetch_limit: int
+) -> list[dict]:
     """Fetch recent posts (or IG /media fallback) using the Page-scoped token for this id."""
     if not page_token:
         return []
     # Primary: Facebook page-style posts
-    posts, ok = _fetch_node_feed(client, actor_id, "posts", page_token)
+    posts, ok = _fetch_node_feed(client, actor_id, "posts", page_token, fetch_limit)
     if ok and posts:
         return posts
     if ok and not posts:
         return []
 
     # Fallback: Instagram business/media style (同樣帶入專頁 Token；若 actor 為純 IG id 可能仍失敗)
-    media, ok2 = _fetch_node_feed(client, actor_id, "media", page_token)
+    media, ok2 = _fetch_node_feed(client, actor_id, "media", page_token, fetch_limit)
     if ok2:
         if media:
             print(f"ℹ️ actor_id={actor_id} 使用 /media fallback 成功。")
@@ -328,13 +325,24 @@ def run() -> list[dict]:
         promoted = fetch_all_promoted_story_ids(client)
         print(f"📌 帳戶內已收集 promoted story id 約 {len(promoted)} 筆（去重後）。")
 
+        try:
+            fetch_lim_global = int(
+                os.getenv("PENDING_POSTS_FETCH_LIMIT", str(_DEFAULT_FETCH_LIMIT)) or _DEFAULT_FETCH_LIMIT
+            )
+        except (TypeError, ValueError):
+            fetch_lim_global = _DEFAULT_FETCH_LIMIT
+        fetch_lim_global = max(1, fetch_lim_global)
+
         for shop in sorted(configs.keys()):
+            scan_k = new_ad_test_scan_per_page_for_shop(shop, shop_configs=configs)
+            fetch_lim = max(scan_k, fetch_lim_global)
             actor_ids = get_actor_ids_for_shop(shop, name_map)
-            print(f"🏪 掃描店鋪：{shop} | actor_ids={actor_ids}")
+            print(f"🏪 掃描店鋪：{shop} | actor_ids={actor_ids} | 每頁檢視最新 {scan_k} 則貼文 | Graph limit={fetch_lim}")
             if not actor_ids:
                 print(f"⚠️ 店鋪「{shop}」在 SHOP_NAME_MAP 無對應 actor/page id，略過。")
                 continue
 
+            shop_candidates: list[dict] = []
             for actor_id in actor_ids:
                 page_token = page_tokens.get(actor_id)
                 if not page_token:
@@ -342,36 +350,47 @@ def run() -> list[dict]:
                         f"⚠️ actor_id={actor_id} 在 /me/accounts 無對應專頁 Token（可能非目前用戶管理的 FB 專頁，或為 IG 帳號 id），略過。"
                     )
                     continue
-                posts = fetch_actor_posts(client, actor_id, page_token)
+                posts = fetch_actor_posts(client, actor_id, page_token, fetch_lim)
                 if not posts:
                     continue
                 posts.sort(key=lambda x: str(x.get("created_time", "")), reverse=True)
+                window = posts[:scan_k]
 
-                for post in posts:
+                for post in window:
                     pid = str(post.get("id", "") or "")
                     if not pid:
                         continue
                     if _post_is_promoted(pid, promoted):
                         continue
                     msg = str(post.get("message", "") or "")
-                    msg_preview = msg[:200] if msg else ""
+                    msg_stored = msg[:2000] if msg else ""
+                    pic = str(post.get("full_picture", "") or "").strip()
                     created = str(post.get("created_time", "") or "")
                     strategy = classify_strategy("", msg, created, "", shop)
                     pool = _pool_name(strategy)
-                    pending.append(
+                    shop_candidates.append(
                         {
                             "shop": shop,
                             "actor_id": actor_id,
                             "post_id": pid,
                             "created_time": created,
-                            "message": msg_preview,
+                            "message": msg_stored,
+                            "full_picture": pic,
                             "pool": pool,
                         }
                     )
                     print(
-                        f"🧪 待測：{shop} | actor_id={actor_id} | post={pid} | pool={pool}（最新貼文尚未對應廣告 story）"
+                        f"🧪 候選：{shop} | actor_id={actor_id} | post={pid} | pool={pool}（未對應廣告 story）"
                     )
-                    break
+
+            cap = new_ad_test_post_cap_for_shop(shop, shop_configs=configs)
+            shop_candidates.sort(key=lambda x: str(x.get("created_time", "") or ""), reverse=True)
+            kept = shop_candidates[:cap]
+            if len(shop_candidates) > cap:
+                print(
+                    f"✂️ 店鋪「{shop}」候選 {len(shop_candidates)} 筆，依上限保留最新 {cap} 筆（NEW_AD_TEST_POSTS / SHOP_CONFIGS.new_ad_test_posts）。"
+                )
+            pending.extend(kept)
 
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(pending, f, ensure_ascii=False, indent=2)

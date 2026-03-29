@@ -7,7 +7,7 @@
       "110713156958120": "OLASE 銅鑼灣店",
       "106885092205252": "OLASE 銅鑼灣店",
       "101023398802050": "OLASE 銅鑼灣店",
-      "109170695132210": "OLASE 銅鑼灣店",
+      "109170695132210": "Olase 柯士甸店",
       "645677431964443": "Olase 旺角店",
       "376025488928222": "Natura Spa 中環",
       "112331955168892": "Natura Spa 中環",
@@ -18,14 +18,13 @@
       "533512276514917": "其他"
     },
     "SHOP_CONFIGS": {
-      "Olase 旺角店": {"total": 700, "bun_ratio": 0.0},
-      "Olase 柯士甸店": {"total": 700, "bun_ratio": 0.3},
-      "OLase 金帝行店": {"total": 700, "bun_ratio": 0.3},
-      "Natura Spa 中環": {"total": 700, "bun_ratio": 0.3},
-      "Natura 荃灣": {"total": 700, "bun_ratio": 0.3},
-      "Natura 太子": {"total": 350, "bun_ratio": 0.5},
-      "Lounge & Skin 尖沙嘴": {"total": 700, "bun_ratio": 0.3},
-      "OLASE 銅鑼灣店": {"total": 700, "bun_ratio": 0.3},
-      "其他": {"total": 500, "bun_ratio": 0.2}
-    }
+      "OLase 金帝行店": {"total": 700,"bun_ratio": 0.3}
+    },
+    "STRATEGY_TARGET_CPC": {"LTV": 35.0, "BUN": 1.5, "GENERAL": 18.0, "NEW": 20.0},
+    "LTV_KEYWORDS": "Gentlelase,755,脫毛,12個月,永久,激光,毛髮",
+    "NEW_AD_PROTECTION_HOURS": 72,
+    "NEW_AD_TEST_BUDGET": 50,
+    "NEW_AD_TEST_SCAN_PER_PAGE": 2,
+    "NEW_AD_TEST_POSTS": 2,
+    "GOOGLE_CREDENTIALS_PATH": "credentials.json"
   }

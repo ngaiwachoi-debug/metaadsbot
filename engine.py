@@ -10,7 +10,31 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from meta_utils import norm_meta_graph_id
+
 load_dotenv()
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+_CONFIG_JSON_CACHE: dict[str, Any] | None = None
+
+
+def _load_config_json() -> dict[str, Any]:
+    """Cached full `config.json` dict (non-engine keys ignored by callers)."""
+    global _CONFIG_JSON_CACHE
+    if _CONFIG_JSON_CACHE is not None:
+        return _CONFIG_JSON_CACHE
+    path = os.path.join(_ROOT, "config.json")
+    if not os.path.isfile(path):
+        _CONFIG_JSON_CACHE = {}
+        return _CONFIG_JSON_CACHE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        _CONFIG_JSON_CACHE = data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        _CONFIG_JSON_CACHE = {}
+    return _CONFIG_JSON_CACHE
 
 
 def _parse_json_env(name: str, default: Any) -> Any:
@@ -23,13 +47,120 @@ def _parse_json_env(name: str, default: Any) -> Any:
         return default
 
 
-STRATEGY_TARGET_CPC = _parse_json_env(
-    "STRATEGY_TARGET_CPC",
-    {"LTV": 35.0, "BUN": 1.5, "GENERAL": 18.0, "NEW": 20.0},
+def shop_configs_from_config_json() -> dict[str, Any]:
+    """SHOP_CONFIGS block from repo config.json only (no SHOP_CONFIGS env merge or subset)."""
+    data = _load_config_json()
+    raw = data.get("SHOP_CONFIGS")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        sk = str(k).strip()
+        if not sk:
+            continue
+        out[sk] = dict(v) if isinstance(v, dict) else v
+    return out
+
+
+def _merge_shop_configs() -> dict[str, Any]:
+    """If env SHOP_CONFIGS is non-empty, active shops = only keys in env (merged per shop with file). Empty env => all file shops."""
+    base = shop_configs_from_config_json()
+    raw = os.getenv("SHOP_CONFIGS", "")
+    if not (raw or "").strip():
+        return base
+    try:
+        env_sc = json.loads(raw)
+    except json.JSONDecodeError:
+        return base
+    if not isinstance(env_sc, dict) or not env_sc:
+        return base
+    merged: dict[str, Any] = {}
+    for shop, env_vals in env_sc.items():
+        sk = str(shop).strip()
+        if not sk:
+            continue
+        file_vals = base.get(sk)
+        if isinstance(env_vals, dict):
+            b = dict(file_vals) if isinstance(file_vals, dict) else {}
+            merged[sk] = {**b, **env_vals}
+        else:
+            merged[sk] = env_vals
+    return merged
+
+
+_DEFAULT_STRATEGY_TARGET_CPC: dict[str, float] = {
+    "LTV": 35.0,
+    "BUN": 1.5,
+    "GENERAL": 18.0,
+    "NEW": 20.0,
+}
+
+
+def _strategy_target_cpc_from_config_file() -> dict[str, float]:
+    base = dict(_DEFAULT_STRATEGY_TARGET_CPC)
+    raw = _load_config_json().get("STRATEGY_TARGET_CPC")
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                base[str(k)] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return base
+
+
+STRATEGY_TARGET_CPC = _parse_json_env("STRATEGY_TARGET_CPC", _strategy_target_cpc_from_config_file())
+SHOP_CONFIGS = _merge_shop_configs()
+
+_ltv_cfg = _load_config_json().get("LTV_KEYWORDS")
+_ltv_file = _ltv_cfg if isinstance(_ltv_cfg, str) and _ltv_cfg.strip() else "Gentlelase,755,脫毛"
+_ltv_env = (os.getenv("LTV_KEYWORDS") or "").strip()
+_ltv_src = _ltv_env if _ltv_env else _ltv_file
+LTV_KEYWORDS = [x.strip().lower() for x in _ltv_src.split(",") if x.strip()]
+
+
+def _int_from_config_then_env(cfg_key: str, env_key: str, default: int) -> int:
+    raw_cfg = _load_config_json().get(cfg_key)
+    parsed = default
+    if raw_cfg is not None and str(raw_cfg).strip() != "":
+        try:
+            parsed = int(raw_cfg)
+        except (TypeError, ValueError):
+            parsed = default
+    raw_env = (os.getenv(env_key) or "").strip()
+    if raw_env:
+        try:
+            return int(raw_env)
+        except (TypeError, ValueError):
+            pass
+    return parsed
+
+
+def _float_from_config_then_env(cfg_key: str, env_key: str, default: float) -> float:
+    raw_cfg = _load_config_json().get(cfg_key)
+    parsed = default
+    if raw_cfg is not None and str(raw_cfg).strip() != "":
+        try:
+            parsed = float(raw_cfg)
+        except (TypeError, ValueError):
+            parsed = default
+    raw_env = (os.getenv(env_key) or "").strip()
+    if raw_env:
+        try:
+            return float(raw_env)
+        except (TypeError, ValueError):
+            pass
+    return parsed
+
+
+NEW_AD_PROTECTION_HOURS = max(0, _int_from_config_then_env("NEW_AD_PROTECTION_HOURS", "NEW_AD_PROTECTION_HOURS", 72))
+NEW_AD_TEST_SCAN_PER_PAGE = max(1, _int_from_config_then_env("NEW_AD_TEST_SCAN_PER_PAGE", "NEW_AD_TEST_SCAN_PER_PAGE", 2))
+NEW_AD_TEST_POSTS = max(1, _int_from_config_then_env("NEW_AD_TEST_POSTS", "NEW_AD_TEST_POSTS", 2))
+
+_gcp_cfg = _load_config_json().get("GOOGLE_CREDENTIALS_PATH")
+GOOGLE_CREDENTIALS_PATH = (
+    (os.getenv("GOOGLE_CREDENTIALS_PATH") or "").strip()
+    or (str(_gcp_cfg).strip() if isinstance(_gcp_cfg, str) and str(_gcp_cfg).strip() else "credentials.json")
 )
-SHOP_CONFIGS = _parse_json_env("SHOP_CONFIGS", {})
-LTV_KEYWORDS = [x.strip().lower() for x in os.getenv("LTV_KEYWORDS", "Gentlelase,755,脫毛").split(",") if x.strip()]
-NEW_AD_PROTECTION_HOURS = int(os.getenv("NEW_AD_PROTECTION_HOURS", "72") or 72)
 try:
     LTV_VALUE_MULTIPLIER = float(os.getenv("LTV_VALUE_MULTIPLIER", "2.0") or 2.0)
 except Exception:
@@ -102,17 +233,18 @@ def adset_tier_key_for_rank(rank: int, y: int, cuts: dict[str, float] | None = N
         return "tail"
     return "bottom"
 
-try:
-    NEW_AD_TEST_BUDGET = float(os.getenv("NEW_AD_TEST_BUDGET", "150") or 150)
-except Exception:
-    NEW_AD_TEST_BUDGET = 150.0
+NEW_AD_TEST_BUDGET = _float_from_config_then_env("NEW_AD_TEST_BUDGET", "NEW_AD_TEST_BUDGET", 150.0)
 
 _ENGINE_DIR = os.path.dirname(os.path.abspath(__file__))
 PENDING_TESTS_JSON_PATH = os.path.join(_ENGINE_DIR, "pending_tests.json")
 
 
-def load_pending_tests_entries() -> list[dict[str, Any]]:
-    """Phase 4: `pending_tests.json` from `check_latest_posts.py` — shops with unpromoted recent posts."""
+def load_pending_tests_entries(*, restrict_to_shop_configs: bool = False) -> list[dict[str, Any]]:
+    """Phase 4: `pending_tests.json` from `check_latest_posts.py` — shops with unpromoted recent posts.
+
+    If ``restrict_to_shop_configs`` is True, drop entries whose ``shop`` is not a key in ``SHOP_CONFIGS``
+    (so a slim config.json does not surface other shops in P00 rows, reserves, or executors).
+    """
     if not os.path.isfile(PENDING_TESTS_JSON_PATH):
         return []
     try:
@@ -131,6 +263,9 @@ def load_pending_tests_entries() -> list[dict[str, Any]]:
                 e["pool"] = _pool_name(strategy)
             else:
                 e["pool"] = "hk"
+    if restrict_to_shop_configs:
+        allowed = {str(k).strip() for k in SHOP_CONFIGS.keys() if str(k).strip()}
+        entries = [e for e in entries if str(e.get("shop", "") or "").strip() in allowed]
     return entries
 
 
@@ -138,7 +273,7 @@ def shop_has_pending_post_test(shop_name: str) -> bool:
     sn = str(shop_name or "").strip()
     if not sn:
         return False
-    for e in load_pending_tests_entries():
+    for e in load_pending_tests_entries(restrict_to_shop_configs=True):
         if str(e.get("shop", "")).strip() == sn:
             return True
     return False
@@ -159,7 +294,7 @@ def pending_post_reserves_by_pool(shop_name: str) -> tuple[float, float]:
         return 0.0, 0.0
     reserve_bun = 0.0
     reserve_hk = 0.0
-    for e in load_pending_tests_entries():
+    for e in load_pending_tests_entries(restrict_to_shop_configs=True):
         if str(e.get("shop", "")).strip() != sn:
             continue
         pool = str(e.get("pool", "hk") or "hk").lower()
@@ -221,6 +356,50 @@ def _shop_config(shop_name: str) -> tuple[float, float]:
     bun_ratio = _to_float(conf.get("bun_ratio", 0.2))
     bun_ratio = min(1.0, max(0.0, bun_ratio))
     return total, bun_ratio
+
+
+def new_ad_test_scan_per_page_for_shop(
+    shop_name: str, shop_configs: dict[str, Any] | None = None,
+) -> int:
+    """How many newest posts to consider per Page (global NEW_AD_TEST_SCAN_PER_PAGE + optional per-shop new_ad_test_scan_per_page)."""
+    default_k = max(1, NEW_AD_TEST_SCAN_PER_PAGE)
+    sn = str(shop_name or "").strip()
+    if not sn:
+        return default_k
+    confs = shop_configs if shop_configs is not None else SHOP_CONFIGS
+    conf = confs.get(sn)
+    if not isinstance(conf, dict):
+        return default_k
+    raw = conf.get("new_ad_test_scan_per_page")
+    if raw is None or raw == "":
+        return default_k
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default_k
+    return max(1, v)
+
+
+def new_ad_test_post_cap_for_shop(
+    shop_name: str, shop_configs: dict[str, Any] | None = None,
+) -> int:
+    """Max pending test rows per shop in pending_tests.json (global NEW_AD_TEST_POSTS + optional per-shop new_ad_test_posts)."""
+    default_cap = max(1, NEW_AD_TEST_POSTS)
+    sn = str(shop_name or "").strip()
+    if not sn:
+        return default_cap
+    confs = shop_configs if shop_configs is not None else SHOP_CONFIGS
+    conf = confs.get(sn)
+    if not isinstance(conf, dict):
+        return default_cap
+    raw = conf.get("new_ad_test_posts")
+    if raw is None or raw == "":
+        return default_cap
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default_cap
+    return max(1, v)
 
 
 def daily_targets(shop_name: str) -> dict[str, float]:
@@ -364,6 +543,57 @@ def aggregate_by_adset(rows: list[dict]) -> dict[str, AdsetAggregate]:
 
 def _pool_name(strategy: str) -> str:
     return "bun" if strategy == "BUN" else "hk"
+
+
+def best_p00_template_adset_id(
+    rows: list[dict],
+    adset_meta: dict[str, AdsetAggregate],
+    shop: str,
+    pool: str,
+    page_actor_id: str,
+) -> str:
+    """
+    Lowest weighted_cpc_7d ad set among rows on the **same Meta page** (row ``actor_id`` or
+    ``instagram_actor_id`` equals ``page_actor_id``) and same **pool** (hk = non-BUN, bun = BUN).
+
+    Does **not** filter by 店名: multi-page brands must not pick a champion ad set from another
+    page. ``shop`` is unused but kept for call-site clarity.
+
+    Only ad sets with 7日 aggregate spend_7d > 0 are considered (aligned with lane ranking inputs).
+    Returns "" if no match (callers should not substitute a brand-level config template).
+    """
+    _ = shop
+    pool_l = str(pool or "hk").lower()
+    page_n = norm_meta_graph_id(page_actor_id)
+    if not page_n:
+        return ""
+
+    candidates: list[AdsetAggregate] = []
+    seen: set[str] = set()
+    for r in rows:
+        if "PENDING" in str(r.get("廣告名稱", "") or "").upper():
+            continue
+        ra = norm_meta_graph_id(r.get("actor_id", ""))
+        ri = norm_meta_graph_id(r.get("instagram_actor_id", ""))
+        if ra != page_n and ri != page_n:
+            continue
+        adset_id = str(r.get("AdSet ID", "") or r.get("廣告ID", "") or "").strip()
+        if not adset_id or adset_id.startswith("adset_fallback"):
+            continue
+        agg = adset_meta.get(adset_id)
+        if agg is None or agg.spend_7d <= 0:
+            continue
+        if _pool_name(agg.strategy) != pool_l:
+            continue
+        if adset_id in seen:
+            continue
+        seen.add(adset_id)
+        candidates.append(agg)
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda a: (a.weighted_cpc_7d, -a.spend_7d, a.adset_id))
+    return norm_meta_graph_id(candidates[0].adset_id)
 
 
 def build_pool_items_by_shop(
@@ -539,11 +769,20 @@ def weighted_pool_allocation(
 
         return underfunded_warning
 
-    bun_pool_total = bun_alloc
-    hk_pool_total = hk_alloc
-    if not by_pool["bun"]:
+    bun_items = by_pool["bun"]
+    hk_items = by_pool["hk"]
+    if not bun_items and not hk_items:
+        bun_pool_total = 0.0
+        hk_pool_total = 0.0
+    elif not bun_items:
         bun_pool_total = 0.0
         hk_pool_total = net_for_single_pool
+    elif not hk_items:
+        bun_pool_total = net_for_single_pool
+        hk_pool_total = 0.0
+    else:
+        bun_pool_total = bun_alloc
+        hk_pool_total = hk_alloc
 
     bun_under = alloc(by_pool["bun"], bun_pool_total, False)
     hk_under = alloc(by_pool["hk"], hk_pool_total, True)

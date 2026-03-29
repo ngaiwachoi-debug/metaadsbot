@@ -11,6 +11,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
 from meta_utils import norm_meta_graph_id, to_float_minor, to_hkd_from_meta_minor
+from engine import GOOGLE_CREDENTIALS_PATH
 from shop_mapping import SHOP_NAME_MAP
 
 UNMAPPED_LABEL = "Unmapped"
@@ -35,7 +36,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _google_credentials_path() -> str:
-    p = (os.getenv("GOOGLE_CREDENTIALS_PATH") or "credentials.json").strip()
+    p = (GOOGLE_CREDENTIALS_PATH or "credentials.json").strip()
     return p if os.path.isabs(p) else os.path.join(_ROOT, p)
 
 

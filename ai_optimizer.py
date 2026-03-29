@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from engine import (
     ENGINE_MIN_DAILY_BUDGET,
+    GOOGLE_CREDENTIALS_PATH,
     NEW_AD_TEST_BUDGET,
     SHOP_CONFIGS,
     AdsetAggregate,
@@ -32,6 +33,7 @@ from engine import (
     adset_tier_key_for_rank,
     aggregate_by_adset,
     aggregate_shop_spend_from_rows,
+    best_p00_template_adset_id,
     build_pool_items_by_shop,
     classify_strategy,
     detect_fatigue,
@@ -56,7 +58,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _google_credentials_path() -> str:
-    p = (os.getenv("GOOGLE_CREDENTIALS_PATH") or "credentials.json").strip()
+    p = (GOOGLE_CREDENTIALS_PATH or "credentials.json").strip()
     return p if os.path.isabs(p) else os.path.join(_ROOT, p)
 
 
@@ -600,10 +602,63 @@ def _is_pending_placeholder_row(r: dict) -> bool:
     return "PENDING" in name.upper()
 
 
-def _audience_isolation_hint(strategy: str) -> str:
-    if strategy == "BUN":
-        return "BUN: Interests + EXCLUDE Traditional Chinese"
-    return "HK: Lifestyle/Beauty + EXCLUDE Philippines/Tagalog/Expats"
+# Pool-level copy for 受眾建議 / 受眾隔離 (do not concatenate; use separate columns + JSON).
+_AUDIENCE_RECOMMENDATION: dict[str, str] = {
+    "BUN": "BUN: Interests",
+    "HK": "HK: Lifestyle/Beauty",
+}
+_AUDIENCE_EXCLUSION: dict[str, str] = {
+    "BUN": "EXCLUDE Traditional Chinese",
+    "HK": "EXCLUDE Philippines/Tagalog/Expats",
+}
+
+
+def _audience_hint_pool_key(strategy: str) -> str:
+    """Map lane strategy (BUN / GENERAL / LTV / …) to BUN vs HK hint keys."""
+    return "BUN" if strategy == "BUN" else "HK"
+
+
+def _audience_recommendation_hint(strategy: str) -> str:
+    return _AUDIENCE_RECOMMENDATION.get(_audience_hint_pool_key(strategy), "")
+
+
+def _audience_exclusion_hint(strategy: str) -> str:
+    return _AUDIENCE_EXCLUSION.get(_audience_hint_pool_key(strategy), "")
+
+
+def _p00_champion_tags_for_pool(
+    champion_tags_by_pool: dict[tuple[str, str], str] | None,
+    shop: str,
+    pool: str,
+) -> str:
+    """Champion interest labels for P00: BUN lane or HK (GENERAL then LTV)."""
+    c = champion_tags_by_pool or {}
+    pl = str(pool or "hk").lower()
+    if pl == "bun":
+        return (c.get((shop, "BUN"), "") or "").strip()
+    g = (c.get((shop, "GENERAL"), "") or "").strip()
+    if g:
+        return g
+    return (c.get((shop, "LTV"), "") or "").strip()
+
+
+def _action_plan_audience_hint_json(
+    strategy: str,
+    *,
+    exclusion: str,
+    tags: str = "",
+    note: str = "",
+) -> str:
+    """Structured audience hints for Action Plan / ops (executor ignores this column)."""
+    obj: dict[str, str] = {
+        "suggestion": _audience_recommendation_hint(strategy),
+        "exclusion": exclusion,
+    }
+    if (tags or "").strip():
+        obj["tags"] = tags.strip()
+    if (note or "").strip():
+        obj["note"] = note.strip()
+    return json.dumps(obj, ensure_ascii=False)
 
 
 def _tier_band_label_zh(tier_key: str) -> str:
@@ -657,6 +712,8 @@ class AdDecision:
     floor_auto_adjust_note: str = ""
     target_cpc: float = 0.0
     tier_key: str = "middle"
+    page_id: str = ""
+    campaign_id: str = ""
 
 
 ACTION_PLAN_TITLE_NEW = "📋 新建廣告清單 (New Ads to Create)"
@@ -669,9 +726,16 @@ ACTION_PLAN_HEADER_NEW_ADS = [
     "策略",
     "複製自（原始Ad名稱）",
     "複製自AdSet ID",
+    "目標廣告組合 ID",
+    "Post或Object Story ID",
+    "專頁 ID",
+    "WhatsApp號碼",
+    "宣傳活動 ID",
+    "最後錯誤",
     "新廣告名稱建議",
     "新受眾標籤",
     "受眾隔離標籤",
+    "AI_受眾建議_JSON",
     "預算建議",
     "創建方式",
 ]
@@ -680,6 +744,7 @@ ACTION_PLAN_HEADER_PAUSE = [
     "策略",
     "廣告名稱",
     "AdSet ID",
+    "廣告 ID",
     "暫停原因",
     "停預算回收",
     "是否刪除素材",
@@ -735,6 +800,17 @@ def _suggested_p00_ad_name(shop: str, post_id: str, pool: str = "hk") -> str:
     return f"{shop}-{mid}-new-{tail}"
 
 
+def _p00_target_adset_id_for_shop_pool(shop: str, pool: str) -> str:
+    """目標廣告組合 ID for P00 when not duplicated from an existing ad set (see SHOP_CONFIGS / config.json)."""
+    conf = SHOP_CONFIGS.get(shop) or {}
+    pl = str(pool or "hk").lower()
+    if pl == "bun":
+        raw = conf.get("p00_bun_adset_id") or conf.get("p00_target_adset_id")
+    else:
+        raw = conf.get("p00_hk_adset_id") or conf.get("p00_target_adset_id")
+    return norm_meta_graph_id(str(raw or ""))
+
+
 def _mau_cell_for_tags(tags: list[str]) -> str:
     if not tags:
         return "—"
@@ -779,9 +855,11 @@ OPERATION_HEADER = [
 ]
 
 
-def _build_p00_rows_for_pending() -> list[list]:
-    """Phase 4: one summary row per (shop, pool) with entries in pending_tests.json (top of sheet)."""
-    entries = load_pending_tests_entries()
+def _build_p00_rows_for_pending(
+    champion_tags_by_pool: dict[tuple[str, str], str] | None = None,
+) -> list[list]:
+    """Phase 4: one row per pending_tests.json entry (aligned with Action Plan + reserves)."""
+    entries = load_pending_tests_entries(restrict_to_shop_configs=True)
     if not entries:
         return []
     n_cols = len(OPERATION_HEADER)
@@ -793,36 +871,56 @@ def _build_p00_rows_for_pending() -> list[list]:
             by_shop_pool[(s, pool)].append(e)
     rows: list[list] = []
     for (shop, pool) in sorted(by_shop_pool.keys()):
-        items = by_shop_pool[(shop, pool)]
-        pool_label = "[BUN]" if pool == "bun" else "[HK]"
-        reserve_total = NEW_AD_TEST_BUDGET * len(items)
-        parts = [f"post_id={e.get('post_id', '')}" for e in items[:5]]
-        suffix = f" …共 {len(items)} 筆" if len(items) > 5 else ""
-        reason = (
-            f"🧪 P00 待測新貼文 {pool_label}：{pool}池已預留 ${reserve_total:.0f} 供測試。 "
-            + ", ".join(parts)
-            + suffix
+        items = sorted(
+            by_shop_pool[(shop, pool)],
+            key=lambda x: str(x.get("created_time", "") or ""),
+            reverse=True,
         )
-        row = [""] * n_cols
-        row[0] = shop
-        row[1] = f"[P00] {pool_label}"
-        row[2] = "（系統）待測新貼文 / 預算預留"
-        row[3] = "- / - / -"
-        row[4] = "-"
-        row[5] = "N/A"
-        row[6] = "N/A"
-        row[7] = "P00"
-        row[8] = "[指令: NO_ACTION]"
-        row[9] = reason
-        row[10] = "-"
-        row[11] = "-"
-        rows.append(row)
+        pool_label = "[BUN]" if pool == "bun" else "[HK]"
+        strategy_for_hint = "BUN" if pool == "bun" else "GENERAL"
+        for e in items:
+            pid = str(e.get("post_id", "") or "")
+            reason = (
+                f"🧪 P00 待測新貼文 {pool_label}：{pool}池此筆預留 ${NEW_AD_TEST_BUDGET:.0f}。 post_id={pid}"
+            )
+            champ = _p00_champion_tags_for_pool(champion_tags_by_pool, shop, pool)
+            excl = _audience_exclusion_hint(strategy_for_hint)
+            hint_json = _action_plan_audience_hint_json(
+                strategy_for_hint,
+                exclusion=excl,
+                tags=champ,
+                note="繼承冠軍受眾 (Champion Inheritance)",
+            )
+            row = [""] * n_cols
+            row[0] = shop
+            row[1] = f"[P00] {pool_label}"
+            row[2] = "（系統）待測新貼文 / 預算預留"
+            row[3] = "- / - / -"
+            row[4] = "-"
+            row[5] = "N/A"
+            row[6] = "N/A"
+            row[7] = "P00"
+            row[8] = "[指令: NO_ACTION]"
+            row[9] = reason
+            row[10] = "-"
+            row[11] = f"${NEW_AD_TEST_BUDGET:.0f}"
+            row[12] = champ or "—"
+            row[15] = hint_json
+            row[16] = excl
+            rows.append(row)
     return rows
 
 
 def _compute_ad_decisions(
     rows: list[dict],
-) -> tuple[list[AdDecision], dict[str, AdsetAggregate], dict[str, float], dict[str, dict], float]:
+) -> tuple[
+    list[AdDecision],
+    dict[str, AdsetAggregate],
+    dict[str, float],
+    dict[str, dict],
+    float,
+    dict[tuple[str, str], str],
+]:
     whitelist = set(SHOP_CONFIGS.keys())
     filtered_rows = [
         r
@@ -956,6 +1054,8 @@ def _compute_ad_decisions(
         campaign_name = str(r.get("Campaign Name", ""))
         adset_id = str(r.get("AdSet ID", "") or r.get("廣告ID", "") or f"adset_fallback_{idx}")
         ad_id = str(r.get("廣告ID", "") or "").strip()
+        page_id_row = str(r.get("actor_id", "") or "").strip()
+        campaign_id_row = str(r.get("Campaign ID", "") or "").strip()
         adset = adset_meta.get(adset_id)
         if adset is None:
             continue
@@ -1161,7 +1261,18 @@ def _compute_ad_decisions(
                 + " 建議於 4 AM 執行，以免驚動學習階段。"
             )
 
-        isolation = _audience_isolation_hint(strategy)
+        isolation = _audience_exclusion_hint(strategy)
+        _hints = json.dumps(
+            {
+                "suggestion": _audience_recommendation_hint(strategy),
+                "exclusion": isolation,
+            },
+            ensure_ascii=False,
+        )
+        if (ai_json_cell or "").strip():
+            ai_json_cell = f"{_hints}\n{ai_json_cell}"
+        else:
+            ai_json_cell = _hints
         tier_key_val = (meta or {}).get("tier_key", "middle")
         decisions.append(
             AdDecision(
@@ -1197,22 +1308,26 @@ def _compute_ad_decisions(
                 floor_auto_adjust_note=floor_auto_adjust_note,
                 target_cpc=target_cpc,
                 tier_key=str(tier_key_val),
+                page_id=page_id_row,
+                campaign_id=campaign_id_row,
             )
         )
 
     decisions.sort(key=lambda d: d.today_spend, reverse=True)
-    return decisions, adset_meta, suggested_by_adset, shop_checks, account_min_budget
+    return decisions, adset_meta, suggested_by_adset, shop_checks, account_min_budget, champion_tags_by_pool
 
 
 def _build_action_plan_grid(
+    refined_rows: list[dict],
     decisions: list[AdDecision],
     adset_meta: dict[str, AdsetAggregate],
     suggested_by_adset: dict[str, float],
+    champion_tags_by_pool: dict[tuple[str, str], str] | None = None,
 ) -> list[list[str]]:
     w = _action_plan_max_width()
     grid: list[list[str]] = []
 
-    entries = load_pending_tests_entries()
+    entries = load_pending_tests_entries(restrict_to_shop_configs=True)
     by_shop_pool: dict[tuple[str, str], list] = defaultdict(list)
     for e in entries:
         s = str(e.get("shop", "") or "").strip()
@@ -1222,38 +1337,77 @@ def _build_action_plan_grid(
 
     rows_new: list[list[str]] = []
     for (shop, pool) in sorted(by_shop_pool.keys()):
-        items = by_shop_pool[(shop, pool)]
-        pid = str(items[0].get("post_id", "") or "")
+        items = sorted(
+            by_shop_pool[(shop, pool)],
+            key=lambda x: str(x.get("created_time", "") or ""),
+            reverse=True,
+        )
         pool_label = "[BUN]" if pool == "bun" else "[HK]"
         strategy_for_hint = "BUN" if pool == "bun" else "GENERAL"
-        rows_new.append(
-            [
-                shop,
-                f"[P00] {pool_label}",
-                "—",
-                "—",
-                _suggested_p00_ad_name(shop, pid, pool),
-                "—",
-                _audience_isolation_hint(strategy_for_hint),
-                f"${NEW_AD_TEST_BUDGET:.0f}",
-                "NEW_FROM_POST",
-            ]
-        )
+        for e in items:
+            pid = str(e.get("post_id", "") or "")
+            actor = str(e.get("actor_id", "") or "").strip()
+            page_for_tpl = norm_meta_graph_id(actor)
+            if not page_for_tpl and "_" in pid:
+                page_for_tpl = norm_meta_graph_id(pid.split("_", 1)[0])
+            p00_template = best_p00_template_adset_id(
+                refined_rows, adset_meta, shop, pool, page_for_tpl
+            )
+            champ = _p00_champion_tags_for_pool(champion_tags_by_pool, shop, pool)
+            excl = _audience_exclusion_hint(strategy_for_hint)
+            hint_json = _action_plan_audience_hint_json(
+                strategy_for_hint,
+                exclusion=excl,
+                tags=champ,
+                note="繼承冠軍受眾 (Champion Inheritance)",
+            )
+            rows_new.append(
+                [
+                    shop,
+                    f"[P00] {pool_label}",
+                    "—",
+                    p00_template,
+                    "",
+                    pid,
+                    actor,
+                    "",
+                    "",
+                    "",
+                    _suggested_p00_ad_name(shop, pid, pool),
+                    champ or "—",
+                    excl,
+                    hint_json,
+                    f"${NEW_AD_TEST_BUDGET:.0f}",
+                    "NEW_FROM_POST",
+                ]
+            )
 
     for d in decisions:
         if not d.duplicate_intent or not d.duplicate_kind:
             continue
         new_tags = ", ".join(d.new_explore_tags) if d.duplicate_kind == "explore" else d.champ_tags
         budget_suggest = f"${NEW_AD_TEST_BUDGET:.0f}" if d.duplicate_kind == "explore" else d.suggested_budget_display
+        dup_hint_json = _action_plan_audience_hint_json(
+            d.strategy,
+            exclusion=d.isolation,
+            tags=new_tags,
+        )
         rows_new.append(
             [
                 d.shop,
                 f"[{d.strategy}]",
                 d.ad_name,
                 d.adset_id,
+                d.adset_id,
+                "",
+                d.page_id or "",
+                "",
+                d.campaign_id or "",
+                "",
                 _suggested_duplicate_ad_name(d.shop, d.strategy, d.ad_name, d.duplicate_kind),
                 new_tags,
                 d.isolation,
+                dup_hint_json,
                 budget_suggest,
                 "DUPLICATE_WITH_NEW_AUDIENCE",
             ]
@@ -1270,6 +1424,7 @@ def _build_action_plan_grid(
                 f"[{d.strategy}]",
                 d.ad_name,
                 d.adset_id,
+                norm_meta_graph_id(d.ad_id) if d.ad_id else "",
                 d.reason_core,
                 reclaim,
                 "否（保留素材）",
@@ -1391,6 +1546,8 @@ def _build_operation_rows_from_decisions(
     adset_meta: dict[str, AdsetAggregate],
     suggested_by_adset: dict[str, float],
     shop_checks: dict[str, dict],
+    *,
+    champion_tags_by_pool: dict[tuple[str, str], str] | None = None,
 ) -> list[list]:
     expected_cols = len(OPERATION_HEADER)
     out: list[list] = []
@@ -1432,19 +1589,29 @@ def _build_operation_rows_from_decisions(
         reserve = float(cfg.get("new_post_budget_reserve", 0) or 0)
         deviation = suggested_sum + reserve - target_gross
         alloc = float(cfg.get("total_allocatable", suggested_sum))
+        bun_s = float(cfg.get("bun_suggested", 0) or 0)
+        hk_s = float(cfg.get("hk_suggested", 0) or 0)
+        engine_sum = float(cfg.get("total_suggested", bun_s + hk_s) or 0)
         extra_reserve = f" | 新貼文預留 ${reserve:.0f}" if reserve > 0.01 else ""
+        mismatch_warn = (
+            f" ⚠與分池合 ${engine_sum:.0f} 差>1.5"
+            if abs(suggested_sum - engine_sum) > 1.5
+            else ""
+        )
         cr = [""] * expected_cols
         cr[0] = f"[核對] {shop}"
         cr[9] = (
-            f"建議總和 ${suggested_sum:.0f} / 可分配池 ${alloc:.0f} / 店日總 ${target_gross:.0f}"
-            f"{extra_reserve} / 偏差(建議+預留-店總) {deviation:+.1f}"
+            f"廣告組加總 ${suggested_sum:.0f} (BUN ${bun_s:.0f} + HK ${hk_s:.0f}) | "
+            f"可分配 ${alloc:.0f} | 店日總 ${target_gross:.0f}{extra_reserve} | "
+            f"偏差(加總+預留-店總) {deviation:+.1f}{mismatch_warn} — "
+            f"勿對「📊建議」逐列SUM(同廣告組多列僅首列為金額)"
         )
         check_rows.append(cr)
 
     cleaned = [row[:-2] for row in out]
     for data_row in cleaned:
         data_row.extend([""] * (expected_cols - len(data_row)))
-    p00_rows = _build_p00_rows_for_pending()
+    p00_rows = _build_p00_rows_for_pending(champion_tags_by_pool)
     for pr in p00_rows:
         pr.extend([""] * (expected_cols - len(pr)))
     cleaned = p00_rows + cleaned
@@ -1453,8 +1620,10 @@ def _build_operation_rows_from_decisions(
 
 
 def _build_action_rows(rows: list[dict]) -> list[list]:
-    d, meta, sug, chk, _ = _compute_ad_decisions(rows)
-    return _build_operation_rows_from_decisions(d, meta, sug, chk)
+    d, meta, sug, chk, _, champ = _compute_ad_decisions(rows)
+    return _build_operation_rows_from_decisions(
+        d, meta, sug, chk, champion_tags_by_pool=champ
+    )
 
 
 def main():
@@ -1466,16 +1635,33 @@ def main():
     ws_ref.update(range_name="A1", values=_refined_to_grid(rows_refined))
     print(f"✅ Refined 已更新: {REFINED_SHEET_TAB} ({len(rows_refined)} 筆)")
 
-    decisions, adset_meta, suggested_by_adset, shop_checks, _ = _compute_ad_decisions(rows_refined)
+    (
+        decisions,
+        adset_meta,
+        suggested_by_adset,
+        shop_checks,
+        _,
+        champion_tags_by_pool,
+    ) = _compute_ad_decisions(rows_refined)
     action_rows = _build_operation_rows_from_decisions(
-        decisions, adset_meta, suggested_by_adset, shop_checks
+        decisions,
+        adset_meta,
+        suggested_by_adset,
+        shop_checks,
+        champion_tags_by_pool=champion_tags_by_pool,
     )
     ws = _get_or_create_worksheet(ss, OUTPUT_TAB)
     ws.clear()
     ws.update(range_name="A1", values=[OPERATION_HEADER] + action_rows)
     print(f"✅ 操作清單已更新: {OUTPUT_TAB} ({len(action_rows)} 筆)")
 
-    plan_grid = _build_action_plan_grid(decisions, adset_meta, suggested_by_adset)
+    plan_grid = _build_action_plan_grid(
+        rows_refined,
+        decisions,
+        adset_meta,
+        suggested_by_adset,
+        champion_tags_by_pool,
+    )
     ws_plan = _get_or_create_worksheet(ss, ACTION_PLAN_TAB)
     ws_plan.clear()
     if plan_grid:

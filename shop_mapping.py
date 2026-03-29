@@ -1,7 +1,7 @@
 """Map Meta ad/page display strings and numeric Graph ids to internal 店名.
 
 Loads from ``SHOP_NAME_MAP_PATH`` (JSON file, multiline-friendly) first, then
-falls back to env ``SHOP_NAME_MAP`` (single-line JSON). Internal 店名 is for
+env ``SHOP_NAME_MAP``, then ``config.json`` key ``SHOP_NAME_MAP``. Internal 店名 is for
 reporting/SHOP_CONFIGS; it need not match the Page's public title on Facebook.
 """
 
@@ -29,8 +29,21 @@ def _coerce_map(data: object) -> dict[str, str]:
     return out
 
 
+def _shop_name_map_from_config_json() -> dict[str, str]:
+    path = os.path.join(_ROOT, "config.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    raw = data.get("SHOP_NAME_MAP") if isinstance(data, dict) else None
+    return _coerce_map(raw) if isinstance(raw, dict) else {}
+
+
 def load_shop_name_map() -> dict[str, str]:
-    """Single source of truth: optional JSON file, then env SHOP_NAME_MAP."""
+    """Precedence: SHOP_NAME_MAP_PATH file > env SHOP_NAME_MAP > config.json SHOP_NAME_MAP > empty."""
     path = (os.getenv("SHOP_NAME_MAP_PATH") or "").strip()
     if path and not os.path.isabs(path):
         path = os.path.join(_ROOT, path)
@@ -46,6 +59,9 @@ def load_shop_name_map() -> dict[str, str]:
             return _coerce_map(json.loads(raw))
         except json.JSONDecodeError:
             print("⚠️ 環境變數 SHOP_NAME_MAP 的 JSON 無法解析。")
+    cfg_map = _shop_name_map_from_config_json()
+    if cfg_map:
+        return cfg_map
     return {}
 
 
