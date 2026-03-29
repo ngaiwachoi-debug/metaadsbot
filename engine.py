@@ -35,10 +35,72 @@ try:
 except Exception:
     LTV_VALUE_MULTIPLIER = 2.0
 try:
-    _min_budget_env = float(os.getenv("MIN_DAILY_BUDGET", "50") or 50)
+    _min_budget_env = float(os.getenv("MIN_DAILY_BUDGET", "8") or 8)
 except Exception:
-    _min_budget_env = 50.0
+    _min_budget_env = 8.0
 DEFAULT_ADSET_MIN_FLOOR = _min_budget_env + 1.0
+ENGINE_MIN_DAILY_BUDGET = _min_budget_env
+
+DEFAULT_TIER_CUTS: dict[str, float] = {
+    "champion": 0.05,
+    "strong": 0.15,
+    "middle": 0.60,
+    "explore": 0.80,
+    "tail": 0.95,
+}
+
+try:
+    LTV_BUDGET_WEIGHT = float(os.getenv("LTV_BUDGET_WEIGHT", "1.5") or 1.5)
+except Exception:
+    LTV_BUDGET_WEIGHT = 1.5
+try:
+    BUDGET_CAP_MIDDLE = float(os.getenv("BUDGET_CAP_MIDDLE", "1.2") or 1.2)
+except Exception:
+    BUDGET_CAP_MIDDLE = 1.2
+try:
+    BUDGET_CAP_CHAMPION_STRONG = float(os.getenv("BUDGET_CAP_CHAMPION_STRONG", "1.5") or 1.5)
+except Exception:
+    BUDGET_CAP_CHAMPION_STRONG = 1.5
+try:
+    ALLOC_RESIDUAL_TOP_FRACTION = float(os.getenv("ALLOC_RESIDUAL_TOP_FRACTION", "0.5") or 0.5)
+except Exception:
+    ALLOC_RESIDUAL_TOP_FRACTION = 0.5
+ALLOC_RESIDUAL_TOP_FRACTION = min(1.0, max(0.01, ALLOC_RESIDUAL_TOP_FRACTION))
+
+
+def get_tier_cuts() -> dict[str, float]:
+    merged = dict(DEFAULT_TIER_CUTS)
+    raw = _parse_json_env("TIER_CUTS", {})
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                merged[str(k)] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return merged
+
+
+def adset_tier_key_for_rank(rank: int, y: int, cuts: dict[str, float] | None = None) -> str:
+    """rank 1 = best (lowest CPC). Returns tier key: champion|strong|middle|explore|tail|bottom."""
+    if y <= 0 or rank < 1:
+        return "middle"
+    c = cuts if cuts is not None else get_tier_cuts()
+    r_ch = max(1, math.ceil(y * float(c.get("champion", 0.05))))
+    r_st = max(r_ch, math.ceil(y * float(c.get("strong", 0.15))))
+    r_mid = max(r_st, math.ceil(y * float(c.get("middle", 0.60))))
+    r_exp = max(r_mid, math.ceil(y * float(c.get("explore", 0.80))))
+    r_tail = max(r_exp, math.ceil(y * float(c.get("tail", 0.95))))
+    if rank <= r_ch:
+        return "champion"
+    if rank <= r_st:
+        return "strong"
+    if rank <= r_mid:
+        return "middle"
+    if rank <= r_exp:
+        return "explore"
+    if rank <= r_tail:
+        return "tail"
+    return "bottom"
 
 try:
     NEW_AD_TEST_BUDGET = float(os.getenv("NEW_AD_TEST_BUDGET", "150") or 150)
@@ -56,9 +118,20 @@ def load_pending_tests_entries() -> list[dict[str, Any]]:
     try:
         with open(PENDING_TESTS_JSON_PATH, encoding="utf-8") as f:
             raw = json.load(f)
-        return raw if isinstance(raw, list) else []
+        entries = raw if isinstance(raw, list) else []
     except Exception:
         return []
+    for e in entries:
+        if not e.get("pool"):
+            msg = str(e.get("message", "") or "")
+            ct = str(e.get("created_time", "") or "")
+            shop = str(e.get("shop", "") or "")
+            if msg:
+                strategy = classify_strategy("", msg, ct, "", shop)
+                e["pool"] = _pool_name(strategy)
+            else:
+                e["pool"] = "hk"
+    return entries
 
 
 def shop_has_pending_post_test(shop_name: str) -> bool:
@@ -74,6 +147,27 @@ def shop_has_pending_post_test(shop_name: str) -> bool:
 def new_post_budget_reserve_for_shop(shop_name: str) -> float:
     """Reserve one block of NEW_AD_TEST_BUDGET per shop while pending post tests exist."""
     return NEW_AD_TEST_BUDGET if shop_has_pending_post_test(shop_name) else 0.0
+
+
+def pending_post_reserves_by_pool(shop_name: str) -> tuple[float, float]:
+    """Return (reserve_bun, reserve_hk) for a shop based on pending_tests.json entries.
+
+    Each pending entry contributes NEW_AD_TEST_BUDGET to its pool.
+    """
+    sn = str(shop_name or "").strip()
+    if not sn:
+        return 0.0, 0.0
+    reserve_bun = 0.0
+    reserve_hk = 0.0
+    for e in load_pending_tests_entries():
+        if str(e.get("shop", "")).strip() != sn:
+            continue
+        pool = str(e.get("pool", "hk") or "hk").lower()
+        if pool == "bun":
+            reserve_bun += NEW_AD_TEST_BUDGET
+        else:
+            reserve_hk += NEW_AD_TEST_BUDGET
+    return reserve_bun, reserve_hk
 
 
 def _to_float(v) -> float:
@@ -138,6 +232,21 @@ def daily_targets(shop_name: str) -> dict[str, float]:
     }
 
 
+def effective_pool_limits(shop_name: str) -> dict[str, float]:
+    """Gross pool caps from SHOP_CONFIGS minus P00 reserves (per pending_tests.json pool)."""
+    t = daily_targets(shop_name)
+    rb, rh = pending_post_reserves_by_pool(shop_name)
+    rb = max(0.0, _to_float(rb))
+    rh = max(0.0, _to_float(rh))
+    return {
+        "shop_daily_cap": t["total"],
+        "bun_limit": max(0.0, t["bun_target"] - rb),
+        "hk_limit": max(0.0, t["hk_target"] - rh),
+        "reserve_bun": rb,
+        "reserve_hk": rh,
+    }
+
+
 def aggregate_shop_spend_from_rows(rows: list[dict]) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
     today_total: dict[str, float] = {}
     today_bun: dict[str, float] = {}
@@ -191,6 +300,7 @@ class AdsetPoolItem:
     strategy: str
     current_budget: float
     cpc_7d: float
+    tier: str = "middle"
 
 
 @dataclass
@@ -256,9 +366,14 @@ def _pool_name(strategy: str) -> str:
     return "bun" if strategy == "BUN" else "hk"
 
 
-def build_pool_items_by_shop(adsets: dict[str, AdsetAggregate]) -> dict[str, list[AdsetPoolItem]]:
+def build_pool_items_by_shop(
+    adsets: dict[str, AdsetAggregate],
+    tier_by_adset: dict[str, str] | None = None,
+) -> dict[str, list[AdsetPoolItem]]:
+    tier_by_adset = tier_by_adset or {}
     items_by_shop: dict[str, list[AdsetPoolItem]] = {}
     for adset in adsets.values():
+        tier = str(tier_by_adset.get(adset.adset_id, "middle") or "middle").lower()
         items_by_shop.setdefault(adset.shop, []).append(
             AdsetPoolItem(
                 adset_id=adset.adset_id,
@@ -266,6 +381,7 @@ def build_pool_items_by_shop(adsets: dict[str, AdsetAggregate]) -> dict[str, lis
                 strategy=adset.strategy,
                 current_budget=adset.current_budget,
                 cpc_7d=adset.weighted_cpc_7d,
+                tier=tier,
             )
         )
     return items_by_shop
@@ -275,26 +391,21 @@ def weighted_pool_allocation(
     shop_name: str,
     items: list[AdsetPoolItem],
     account_min_budget: float | None = None,
-    new_post_budget_reserve: float = 0.0,
-) -> tuple[dict[str, float], dict[str, float]]:
+    reserve_bun: float = 0.0,
+    reserve_hk: float = 0.0,
+) -> tuple[dict[str, float], dict[str, Any]]:
     """
-    AdSet Budget Allocation with Floor Guarantee.
-    1. Reserve ADSET_MIN_FLOOR per active AdSet.
-    2. Distribute remaining pool budget by 1/cpc_7d weight.
-    3. Apply upper cap (current_budget * 1.2).
-    4. Residual fill to top performers if under-allocated.
-    5. Trim from worst if over-allocated.
-
-    new_post_budget_reserve: subtract from shop daily total (Phase 4 pending post tests) before BUN/HK split.
+    AdSet Budget Allocation with Floor Guarantee and tier-aware caps/floors.
+    HK pool: LTV AdSets get LTV_BUDGET_WEIGHT on 1/cpc scores.
+    Residual fill/trim uses ALLOC_RESIDUAL_TOP_FRACTION.
+    Reserves are subtracted from the correct pool target (BUN or HK).
     """
     total, bun_ratio = _shop_config(shop_name)
-    reserve = max(0.0, _to_float(new_post_budget_reserve))
-    total_eff = max(0.0, total - reserve)
-    t = {
-        "total": total_eff,
-        "bun_target": total_eff * bun_ratio,
-        "hk_target": total_eff * (1.0 - bun_ratio),
-    }
+    rb = max(0.0, _to_float(reserve_bun))
+    rh = max(0.0, _to_float(reserve_hk))
+    bun_alloc = max(0.0, total * bun_ratio - rb)
+    hk_alloc = max(0.0, total * (1.0 - bun_ratio) - rh)
+    net_for_single_pool = max(0.0, total - rb - rh)
     adset_min_floor = max(
         1.0,
         (_to_float(account_min_budget) + 1.0) if account_min_budget is not None else DEFAULT_ADSET_MIN_FLOOR,
@@ -305,56 +416,73 @@ def weighted_pool_allocation(
 
     suggestions: dict[str, float] = {}
 
-    def alloc(pool_items: list[AdsetPoolItem], pool_total: float):
+    def _tier_cap_mult(tier: str) -> float:
+        tnorm = (tier or "middle").lower()
+        if tnorm in ("champion", "strong"):
+            if BUDGET_CAP_CHAMPION_STRONG <= 0.01:
+                return 1e9
+            return max(1.0, BUDGET_CAP_CHAMPION_STRONG)
+        if tnorm == "middle":
+            return max(1.0, BUDGET_CAP_MIDDLE)
+        return 1.0
+
+    def alloc(pool_items: list[AdsetPoolItem], pool_total: float, is_hk_pool: bool) -> bool:
         if not pool_items:
-            return
+            return False
 
-        n = len(pool_items)
-        floor_total = adset_min_floor * n
-
-        # 冷啟動：current_budget=0 → 100，避免後續運算問題（不用於計算，只墊基礎值）
         for i in pool_items:
             if i.current_budget <= 0:
                 i.current_budget = 100.0
 
-        # -------- 門檻不足警告 --------
-        if pool_total < floor_total - 0.01:
-            underfunded_warning = True
-        else:
-            underfunded_warning = False
-
-        # -------- 先每人一個 floor --------
+        min_budget: dict[str, float] = {}
         for x in pool_items:
-            suggestions[x.adset_id] = adset_min_floor
+            aid = x.adset_id
+            tier = (x.tier or "middle").lower()
+            if tier in ("champion", "strong"):
+                min_budget[aid] = max(adset_min_floor, x.current_budget)
+            else:
+                min_budget[aid] = adset_min_floor
 
-        # -------- 計算餘額 --------
+        floor_total = sum(min_budget[x.adset_id] for x in pool_items)
+        underfunded_warning = pool_total < floor_total - 0.01
+
+        for x in pool_items:
+            suggestions[x.adset_id] = min_budget[x.adset_id]
+
         remaining = pool_total - floor_total
 
-        # -------- 餘額按 1/cpc_7d 分配 --------
-        scores = {x.adset_id: 1.0 / max(0.1, x.cpc_7d) for x in pool_items}
+        scores: dict[str, float] = {}
+        for x in pool_items:
+            base = 1.0 / max(0.1, x.cpc_7d)
+            if is_hk_pool and x.strategy == "LTV":
+                base *= LTV_BUDGET_WEIGHT
+            scores[x.adset_id] = base
         sum_scores = sum(scores.values()) or 1.0
-        upper = {x.adset_id: x.current_budget * 1.2 for x in pool_items}
+
+        upper: dict[str, float] = {}
+        for x in pool_items:
+            aid = x.adset_id
+            upper[aid] = x.current_budget * _tier_cap_mult(x.tier)
 
         if remaining > 0.01 and not underfunded_warning:
             for x in pool_items:
-                raw = remaining * (scores[x.adset_id] / sum_scores)
-                suggestions[x.adset_id] += raw
+                aid = x.adset_id
+                raw = remaining * (scores[aid] / sum_scores)
+                suggestions[aid] += raw
 
-        # -------- 套用 upper cap --------
         for x in pool_items:
             aid = x.adset_id
             suggestions[aid] = min(suggestions[aid], upper[aid])
 
-        # -------- 歸一化：補足總額 --------
         current_sum = sum(suggestions[x.adset_id] for x in pool_items)
         delta = pool_total - current_sum
 
         ranked_best = sorted(pool_items, key=lambda z: z.cpc_7d)
         ranked_worst = list(reversed(ranked_best))
+        frac = ALLOC_RESIDUAL_TOP_FRACTION
 
         if delta > 0.01:
-            # 分配不足 -> 補貼前 50% 高表現者
-            top_n = max(1, math.ceil(len(ranked_best) * 0.5))
+            top_n = max(1, math.ceil(len(ranked_best) * frac))
             top = ranked_best[:top_n]
             for _ in range(30):
                 if delta <= 0.01:
@@ -374,9 +502,8 @@ def weighted_pool_allocation(
                 if not progressed:
                     break
         elif delta < -0.01:
-            # 分配超額 -> 從後 50% 回收
             need_cut = -delta
-            tail_n = max(1, math.ceil(len(ranked_worst) * 0.5))
+            tail_n = max(1, math.ceil(len(ranked_worst) * frac))
             tail = ranked_worst[:tail_n]
             for _ in range(30):
                 if need_cut <= 0.01:
@@ -385,7 +512,8 @@ def weighted_pool_allocation(
                 share = need_cut / max(1, len(tail))
                 for z in tail:
                     aid = z.adset_id
-                    room = suggestions[aid] - adset_min_floor
+                    floor_i = min_budget[aid]
+                    room = suggestions[aid] - floor_i
                     if room <= 0:
                         continue
                     cut = min(share, room)
@@ -396,8 +524,7 @@ def weighted_pool_allocation(
                 if not progressed:
                     break
         if delta > 0.01:
-            # 若上限卡死仍不足，為了逼近店鋪總額，解除上限繼續補至高表現 AdSet
-            top_n = max(1, math.ceil(len(ranked_best) * 0.5))
+            top_n = max(1, math.ceil(len(ranked_best) * frac))
             top = ranked_best[:top_n]
             for _ in range(30):
                 if delta <= 0.01:
@@ -412,26 +539,31 @@ def weighted_pool_allocation(
 
         return underfunded_warning
 
-    bun_pool_total = t["bun_target"]
-    hk_pool_total = t["hk_target"]
+    bun_pool_total = bun_alloc
+    hk_pool_total = hk_alloc
     if not by_pool["bun"]:
         bun_pool_total = 0.0
-        hk_pool_total = t["total"]
+        hk_pool_total = net_for_single_pool
 
-    bun_under = alloc(by_pool["bun"], bun_pool_total)
-    hk_under = alloc(by_pool["hk"], hk_pool_total)
+    bun_under = alloc(by_pool["bun"], bun_pool_total, False)
+    hk_under = alloc(by_pool["hk"], hk_pool_total, True)
 
     bun_s = sum(suggestions[x.adset_id] for x in by_pool["bun"]) if by_pool["bun"] else 0.0
     hk_s = sum(suggestions[x.adset_id] for x in by_pool["hk"]) if by_pool["hk"] else 0.0
-    check = {
+    reserve_total = rb + rh
+    total_allocatable = bun_pool_total + hk_pool_total
+    check: dict[str, Any] = {
         "bun_suggested": bun_s,
         "bun_target": bun_pool_total,
         "hk_suggested": hk_s,
         "hk_target": hk_pool_total,
         "total_suggested": bun_s + hk_s,
-        "total_target": t["total"],
+        "total_target": total,
         "total_target_before_reserve": total,
-        "new_post_budget_reserve": reserve,
+        "total_allocatable": total_allocatable,
+        "new_post_budget_reserve": reserve_total,
+        "reserve_bun": rb,
+        "reserve_hk": rh,
         "adset_min_floor": adset_min_floor,
         "bun_underfunded_warning": bun_under,
         "hk_underfunded_warning": hk_under,

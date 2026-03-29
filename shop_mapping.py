@@ -1,6 +1,8 @@
-"""Map Meta ad/page display strings and numeric Graph ids to internal 店名 (from .env SHOP_NAME_MAP).
+"""Map Meta ad/page display strings and numeric Graph ids to internal 店名.
 
-Internal 店名 is for reporting/SHOP_CONFIGS; it need not match the Page's public title on Facebook.
+Loads from ``SHOP_NAME_MAP_PATH`` (JSON file, multiline-friendly) first, then
+falls back to env ``SHOP_NAME_MAP`` (single-line JSON). Internal 店名 is for
+reporting/SHOP_CONFIGS; it need not match the Page's public title on Facebook.
 """
 
 from __future__ import annotations
@@ -10,14 +12,44 @@ import os
 
 from dotenv import load_dotenv
 
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 load_dotenv()
 
-try:
-    SHOP_NAME_MAP: dict = json.loads(os.getenv("SHOP_NAME_MAP", "{}"))
-    if not isinstance(SHOP_NAME_MAP, dict):
-        SHOP_NAME_MAP = {}
-except json.JSONDecodeError:
-    SHOP_NAME_MAP = {}
+
+def _coerce_map(data: object) -> dict[str, str]:
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        out[key] = str(v).strip() if v is not None else ""
+    return out
+
+
+def load_shop_name_map() -> dict[str, str]:
+    """Single source of truth: optional JSON file, then env SHOP_NAME_MAP."""
+    path = (os.getenv("SHOP_NAME_MAP_PATH") or "").strip()
+    if path and not os.path.isabs(path):
+        path = os.path.join(_ROOT, path)
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return _coerce_map(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"⚠️ SHOP_NAME_MAP_PATH 讀取失敗 ({path}): {e}")
+    raw = os.getenv("SHOP_NAME_MAP", "") or ""
+    if raw.strip():
+        try:
+            return _coerce_map(json.loads(raw))
+        except json.JSONDecodeError:
+            print("⚠️ 環境變數 SHOP_NAME_MAP 的 JSON 無法解析。")
+    return {}
+
+
+SHOP_NAME_MAP: dict[str, str] = load_shop_name_map()
 
 
 def squish_name(s: str) -> str:

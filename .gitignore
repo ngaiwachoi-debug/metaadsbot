@@ -8,3 +8,4 @@ node_modules/
 pending_tests.json
 meta_interests_lib.json
 .cursor/
+.gitnexus

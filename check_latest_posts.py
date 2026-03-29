@@ -16,6 +16,9 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from engine import classify_strategy, _pool_name
+from shop_mapping import SHOP_NAME_MAP
+
 if sys.platform == "win32":
     import io
 
@@ -47,14 +50,11 @@ def _parse_json_env(name: str, default: Any) -> Any:
 
 
 def load_local_config() -> tuple[dict[str, str], dict[str, dict]]:
-    """Load SHOP_NAME_MAP + SHOP_CONFIGS from .env (same as shop_mapping / engine)."""
-    name_map = _parse_json_env("SHOP_NAME_MAP", {})
+    """SHOP_NAME_MAP from shop_mapping (file or env); SHOP_CONFIGS from .env JSON."""
     shop_configs = _parse_json_env("SHOP_CONFIGS", {})
-    if not isinstance(name_map, dict):
-        name_map = {}
     if not isinstance(shop_configs, dict):
         shop_configs = {}
-    return name_map, shop_configs
+    return SHOP_NAME_MAP, shop_configs
 
 
 def _is_numeric_graph_id(key: str) -> bool:
@@ -192,6 +192,38 @@ def fetch_page_access_tokens(client: httpx.Client) -> dict[str, str]:
     return mapping
 
 
+def fetch_managed_pages_directory(client: httpx.Client) -> dict[str, str]:
+    """
+    GET /me/accounts with id,name only (one-shot helper to paste ids into shop_name_map.json).
+    Returns page_id -> Graph page name (not internal 店名).
+    """
+    out: dict[str, str] = {}
+    base = f"https://graph.facebook.com/{API_VERSION}/me/accounts"
+    params = {
+        "fields": "id,name",
+        "limit": 100,
+        "access_token": ACCESS_TOKEN,
+    }
+    url: str | None = base
+    first_page = True
+    while url:
+        r = client.get(url, params=params if first_page else None, timeout=HTTP_TIMEOUT)
+        first_page = False
+        if r.status_code != 200:
+            _print_meta_error("me/accounts (dump)", r)
+            break
+        data = r.json()
+        for row in data.get("data", []) or []:
+            if not isinstance(row, dict):
+                continue
+            pid = str(row.get("id") or "").strip()
+            if not pid:
+                continue
+            out[pid] = str(row.get("name") or "").strip()
+        url = (data.get("paging") or {}).get("next")
+    return out
+
+
 def _fetch_node_feed(
     client: httpx.Client, actor_id: str, edge: str, page_token: str
 ) -> tuple[list[dict], bool]:
@@ -321,16 +353,23 @@ def run() -> list[dict]:
                         continue
                     if _post_is_promoted(pid, promoted):
                         continue
+                    msg = str(post.get("message", "") or "")
+                    msg_preview = msg[:200] if msg else ""
+                    created = str(post.get("created_time", "") or "")
+                    strategy = classify_strategy("", msg, created, "", shop)
+                    pool = _pool_name(strategy)
                     pending.append(
                         {
                             "shop": shop,
                             "actor_id": actor_id,
                             "post_id": pid,
-                            "created_time": post.get("created_time", ""),
+                            "created_time": created,
+                            "message": msg_preview,
+                            "pool": pool,
                         }
                     )
                     print(
-                        f"🧪 待測：{shop} | actor_id={actor_id} | post={pid}（最新貼文尚未對應廣告 story）"
+                        f"🧪 待測：{shop} | actor_id={actor_id} | post={pid} | pool={pool}（最新貼文尚未對應廣告 story）"
                     )
                     break
 
@@ -340,5 +379,31 @@ def run() -> list[dict]:
     return pending
 
 
+def run_dump_pages() -> None:
+    if not ACCESS_TOKEN:
+        print("❌ META_ACCESS_TOKEN 未設定。")
+        return
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    with httpx.Client(limits=limits) as client:
+        directory = fetch_managed_pages_directory(client)
+    print(json.dumps(directory, ensure_ascii=False, indent=2))
+    print(
+        f"\n✅ 共 {len(directory)} 筆 page id → name。請將對應內部店名寫入 shop_name_map.json（或 SHOP_NAME_MAP）。",
+        flush=True,
+    )
+
+
 if __name__ == "__main__":
-    run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Check latest page posts vs promoted ads.")
+    parser.add_argument(
+        "--dump-pages",
+        action="store_true",
+        help="呼叫 /me/accounts 一次，輸出 page_id→name JSON 供補齊 shop_name_map.json",
+    )
+    args = parser.parse_args()
+    if args.dump_pages:
+        run_dump_pages()
+    else:
+        run()

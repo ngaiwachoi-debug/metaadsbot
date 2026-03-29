@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
-from meta_utils import to_float_minor, to_hkd_from_meta_minor
+from meta_utils import norm_meta_graph_id, to_float_minor, to_hkd_from_meta_minor
 from shop_mapping import SHOP_NAME_MAP
 
 UNMAPPED_LABEL = "Unmapped"
@@ -69,15 +69,7 @@ def get_raw_worksheet():
 
 
 def _norm_id(v) -> str:
-    if v is None or v == "":
-        return ""
-    s = str(v).strip()
-    if s.replace(".", "", 1).isdigit():
-        try:
-            return str(int(float(s)))
-        except Exception:
-            return s
-    return s
+    return norm_meta_graph_id(v)
 
 
 def _normalize_creative_field(creative_raw) -> dict:
