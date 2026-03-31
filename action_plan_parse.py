@@ -19,13 +19,22 @@ from ai_optimizer import (
     get_google_sheet,
 )
 
+def _norm_header_key(s: str) -> str:
+    """Normalize header for fallback match: strip and remove all whitespace (Sheets often add spaces)."""
+    return "".join(ch for ch in (s or "").strip() if not ch.isspace())
+
+
 def _header_col_index(header_row: list[str], label: str) -> int | None:
-    """0-based column for exact header text (stripped), or None."""
+    """0-based column for header text: exact strip match first, then whitespace-tolerant match."""
     want = (label or "").strip()
     if not want:
         return None
     for i, cell in enumerate(header_row):
         if (cell or "").strip() == want:
+            return i
+    want_key = _norm_header_key(want)
+    for i, cell in enumerate(header_row):
+        if _norm_header_key(cell or "") == want_key:
             return i
     return None
 

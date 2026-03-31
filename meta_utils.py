@@ -18,6 +18,9 @@ def norm_meta_graph_id(v) -> str:
     s = str(v).strip().replace(",", "")
     if not s:
         return ""
+    # object_story_id is "{page_id}_{post_id}"; Decimal() treats "_" as grouping and merges digits.
+    if "_" in s:
+        return s
     if s.isdigit():
         return s
     try:
@@ -29,6 +32,27 @@ def norm_meta_graph_id(v) -> str:
     except (InvalidOperation, ValueError, OverflowError):
         pass
     return s
+
+
+def normalize_object_story_id(raw_story: str, page_id: str) -> str:
+    """
+    Graph ``object_story_id`` is ``{page_id}_{post_id}``. Spreadsheets often store it as a number, which
+    concatenates digits and drops the underscore — rebuild when we have a matching page id prefix.
+    """
+    s = str(raw_story or "").strip().replace(",", "")
+    if not s:
+        return ""
+    if "_" in s:
+        left, _, right = s.partition("_")
+        rs = right.strip()
+        if left.isdigit() and rs.isdigit():
+            return f"{left}_{rs}"
+        return s
+    pn = norm_meta_graph_id(page_id)
+    sn = norm_meta_graph_id(s)
+    if pn and sn.isdigit() and sn.startswith(pn) and len(sn) > len(pn) + 4:
+        return f"{pn}_{sn[len(pn):]}"
+    return sn or s
 
 
 def to_hkd_from_meta_minor(value) -> float:

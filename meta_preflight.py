@@ -1,4 +1,4 @@
-"""Preflight GETs for Action Plan executors: WhatsApp / ad set / campaign checks with caching."""
+"""Preflight GETs for Action Plan executors: ad set / campaign / page checks with caching."""
 
 from __future__ import annotations
 
@@ -7,9 +7,7 @@ from typing import Any
 
 from meta_graph_write import GraphClient
 
-# Ad set destination types that satisfy "WhatsApp mandatory" product rule (subset; extend as needed).
-# Messaging / WhatsApp ad sets: organic object_story_id creatives may fail at ad create (Graph 1487891);
-# executors should use Click-to-WhatsApp object_story_spec for NEW_FROM_POST on these destinations.
+# Kept for other modules / docs that reference destination taxonomy.
 WHATSAPP_DESTINATION_TYPES = frozenset(
     {
         "WHATSAPP",
@@ -19,7 +17,6 @@ WHATSAPP_DESTINATION_TYPES = frozenset(
     }
 )
 
-# Superset for preflight: allows Messenger / IG+Messenger when ad set fallback skips WhatsApp.
 MESSAGING_DESTINATION_TYPES = WHATSAPP_DESTINATION_TYPES | frozenset(
     {
         "MESSENGER",
@@ -27,7 +24,6 @@ MESSAGING_DESTINATION_TYPES = WHATSAPP_DESTINATION_TYPES | frozenset(
     }
 )
 
-# Creative path without WhatsApp CTAs (page-only click-to-messenger).
 MESSAGING_NO_WHATSAPP_CREATIVE_TYPES = frozenset(
     {
         "MESSENGER",
@@ -35,9 +31,19 @@ MESSAGING_NO_WHATSAPP_CREATIVE_TYPES = frozenset(
     }
 )
 
+ENGAGEMENT_DESTINATION_TYPES = frozenset(
+    {
+        "UNDEFINED",
+        "ON_POST",
+        "ON_VIDEO",
+        "ON_PAGE",
+        "ON_EVENT",
+    }
+)
+
 ADSET_FIELDS = (
     "id,name,status,effective_status,campaign_id,destination_type,optimization_goal,"
-    "billing_event,bid_strategy,daily_budget,lifetime_budget,promoted_object,targeting,attribution_spec"
+    "billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,promoted_object,targeting,attribution_spec"
 )
 
 
@@ -77,7 +83,7 @@ def get_page_cached(client: GraphClient, page_id: str, cache: dict[str, dict]) -
     return cache[pid]
 
 
-def preflight_new_ad_whatsapp(
+def preflight_new_ad_row(
     client: GraphClient,
     *,
     target_adset_id: str,
@@ -91,18 +97,14 @@ def preflight_new_ad_whatsapp(
     """
     Returns (status, messages) where status is PASS | WARN | FAIL.
     FAIL blocks creative/ad POST for new ads executor.
+
+    Native Cloning uses ``object_story_id`` only; destination-specific CTWA checks are not required here.
+    Validates promoted page and optional sheet campaign alignment.
     """
     msgs: list[str] = []
     adset = get_adset_cached(client, target_adset_id, adset_cache)
     if not adset.get("id"):
         return "FAIL", ["empty_or_invalid_adset_id"]
-
-    dst = str(adset.get("destination_type") or "").upper() or "UNDEFINED"
-    if dst not in MESSAGING_DESTINATION_TYPES:
-        msgs.append(
-            f"destination_type={dst} not in messaging set (need one of {sorted(MESSAGING_DESTINATION_TYPES)})"
-        )
-        return "FAIL", msgs
 
     po = adset.get("promoted_object") or {}
     if not isinstance(po, dict):
@@ -123,19 +125,15 @@ def preflight_new_ad_whatsapp(
         msgs.append(f"sheet 宣傳活動 ID {sheet_camp} != ad set campaign_id {cid}")
         return "FAIL", msgs
 
-    camp = get_campaign_cached(client, cid, campaign_cache) if cid else {}
-    obj = str(camp.get("objective") or "")
-    ok_objectives = (
-        "OUTCOME_ENGAGEMENT",
-        "OUTCOME_LEADS",
-        "OUTCOME_SALES",
-        "OUTCOME_TRAFFIC",
-    )
-    if obj and obj not in ok_objectives:
-        msgs.append(f"campaign objective={obj} may be incompatible with Click-to-WhatsApp (see Meta docs)")
-        # WARN only — some accounts use aliases
-        logger.warning("WhatsApp preflight WARN: %s", msgs[-1])
-        return "WARN", msgs
+    dst = str(adset.get("destination_type") or "").upper() or "UNDEFINED"
+    if dst in ENGAGEMENT_DESTINATION_TYPES:
+        camp = get_campaign_cached(client, cid, campaign_cache) if cid else {}
+        obj = str(camp.get("objective") or "")
+        logger.info(
+            "preflight new_ad: destination_type=%s campaign_objective=%s",
+            dst,
+            obj or "unknown",
+        )
 
     if sheet_page:
         pg = get_page_cached(client, sheet_page, page_cache)
@@ -144,3 +142,27 @@ def preflight_new_ad_whatsapp(
             return "WARN", msgs
 
     return "PASS", msgs
+
+
+def preflight_new_ad_whatsapp(
+    client: GraphClient,
+    *,
+    target_adset_id: str,
+    sheet_campaign_id: str,
+    sheet_page_id: str,
+    adset_cache: dict[str, dict],
+    campaign_cache: dict[str, dict],
+    page_cache: dict[str, dict],
+    logger: logging.Logger,
+) -> tuple[str, list[str]]:
+    """Backward-compatible alias for :func:`preflight_new_ad_row`."""
+    return preflight_new_ad_row(
+        client,
+        target_adset_id=target_adset_id,
+        sheet_campaign_id=sheet_campaign_id,
+        sheet_page_id=sheet_page_id,
+        adset_cache=adset_cache,
+        campaign_cache=campaign_cache,
+        page_cache=page_cache,
+        logger=logger,
+    )

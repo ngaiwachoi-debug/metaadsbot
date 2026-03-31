@@ -11,6 +11,7 @@ import math
 import os
 import re
 import sys
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,11 +41,13 @@ from engine import (
     effective_pool_limits,
     get_dynamic_target_cpc,
     get_tier_cuts,
+    is_budget_eligible_adset,
     load_pending_tests_entries,
     pending_post_reserves_by_pool,
     trend_ratio,
     weighted_pool_allocation,
 )
+from meta_audience_hints import AUDIENCE_EXCLUSION_BY_POOL
 from meta_targeting import parse_targeting_details
 from meta_utils import norm_meta_graph_id, to_float_minor, to_hkd_from_meta_minor
 from shop_mapping import SHOP_NAME_MAP, map_shop_name
@@ -90,6 +93,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 BLOCK_DOWNGRADE_CHAMPION_STRONG = _env_bool("BLOCK_DOWNGRADE_CHAMPION_STRONG", True)
+try:
+    BUDGET_ELIGIBILITY_MIN_AGE_HOURS = float(
+        os.getenv("BUDGET_ELIGIBILITY_MIN_AGE_HOURS", "48") or 48
+    )
+except Exception:
+    BUDGET_ELIGIBILITY_MIN_AGE_HOURS = 48.0
 
 META_GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v18.0").strip() or "v18.0"
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "") or ""
@@ -107,6 +116,9 @@ REFINED_COLUMNS = [
     "fb_page_name",
     "Campaign Name",
     "Campaign ID",
+    "optimization_goal",
+    "destination_type",
+    "campaign_objective",
     "AdSet ID",
     "AdSet Name",
     "7日平均 CPC",
@@ -300,6 +312,9 @@ def refine_raw_rows(rows_raw: list[dict]) -> list[dict]:
             "fb_page_name": fb_page_name,
             "Campaign Name": campaign_name,
             "Campaign ID": str(r.get("Campaign ID", "") or ""),
+            "optimization_goal": str(r.get("optimization_goal", "") or "").strip(),
+            "destination_type": str(r.get("destination_type", "") or "").strip(),
+            "campaign_objective": str(r.get("campaign_objective", "") or "").strip(),
             "AdSet ID": str(r.get("AdSet ID", "") or ""),
             "AdSet Name": str(r.get("AdSet Name", "") or ""),
             "7日平均 CPC": round(_to_float(r.get("7日平均 CPC", 0)), 4),
@@ -543,6 +558,17 @@ def _http_post_json(url: str, headers: dict[str, str], payload: dict) -> dict | 
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except TimeoutError:
+        print("⚠️ LLM HTTP 逾時（90 秒）。", flush=True)
+        return None
+    except socket.timeout:
+        print("⚠️ LLM HTTP 逾時（90 秒）。", flush=True)
+        return None
+    except urllib.error.URLError as e:
+        r = getattr(e, "reason", None)
+        if isinstance(r, TimeoutError) or type(r).__name__ == "timeout":
+            print("⚠️ LLM HTTP 逾時（90 秒）。", flush=True)
+        return None
     except Exception:
         return None
 
@@ -569,6 +595,7 @@ def _generate_new_explore_tags(champion_tags: str, loser_tags: str) -> list[str]
             + "、".join(candidates[:20])
             + "\n\n必須使用清單內詞彙，嚴禁自創拼寫。若清單不足 3 個則盡量輸出。"
         )
+        print("⏳ 正在呼叫 LLM 產生探索標籤（最多約 90 秒，請稍候）…", flush=True)
         js = _http_post_json(
             url,
             hdr,
@@ -578,6 +605,8 @@ def _generate_new_explore_tags(champion_tags: str, loser_tags: str) -> list[str]
                 "temperature": 0.2,
             },
         )
+        if js is None:
+            print("ℹ️ 改用本地興趣候選。", flush=True)
         if js and isinstance(js.get("choices"), list) and js["choices"]:
             msg = js["choices"][0].get("message", {}) or {}
             text = str(msg.get("content", "") or "").strip()
@@ -608,8 +637,7 @@ _AUDIENCE_RECOMMENDATION: dict[str, str] = {
     "HK": "HK: Lifestyle/Beauty",
 }
 _AUDIENCE_EXCLUSION: dict[str, str] = {
-    "BUN": "EXCLUDE Traditional Chinese",
-    "HK": "EXCLUDE Philippines/Tagalog/Expats",
+    **AUDIENCE_EXCLUSION_BY_POOL,
 }
 
 
@@ -911,6 +939,94 @@ def _build_p00_rows_for_pending(
     return rows
 
 
+def load_refined_rows_from_sheet() -> list[dict]:
+    """Load Refined worksheet as list[dict] (same shape as ``refine_raw_rows`` output)."""
+    ss = get_google_sheet()
+    try:
+        ws = ss.worksheet(REFINED_SHEET_TAB)
+    except Exception:
+        return []
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    header = [_normalize_header_key(x) for x in values[0]]
+    col_index = {h: i for i, h in enumerate(header)}
+    out: list[dict] = []
+    for row in values[1:]:
+        d: dict[str, Any] = {}
+        for col in REFINED_COLUMNS:
+            i = col_index.get(col)
+            if i is None:
+                d[col] = ""
+            else:
+                d[col] = row[i] if i < len(row) else ""
+        out.append(d)
+    return out
+
+
+def compute_champion_tags_by_pool(refined_rows: list[dict]) -> dict[tuple[str, str], str]:
+    """
+    Recompute champion audience tag strings per (shop, strategy) from Refined rows.
+    Same rules as the first phase of ``_compute_ad_decisions`` (lowest weighted_cpc_7d ad set per lane).
+    """
+    whitelist = set(SHOP_CONFIGS.keys())
+    filtered_rows = [
+        r
+        for r in refined_rows
+        if str(r.get("店名", "") or "").strip() in whitelist
+        or _is_unknown_shop_label(str(r.get("店名", "") or ""))
+    ]
+    rows = filtered_rows
+    tag_cache: dict[str, str] = {}
+
+    def _tags_cached(tj: str) -> str:
+        if tj not in tag_cache:
+            tag_cache[tj] = _extract_audience_tags(tj)
+        return tag_cache[tj]
+
+    shop_active_counts: dict[str, int] = defaultdict(int)
+    for r in rows:
+        if _is_pending_placeholder_row(r):
+            continue
+        if _to_float(r.get("7日花費", 0)) <= 0:
+            continue
+        shop = str(r.get("店名", "") or r.get("來源專頁", "") or "").strip() or "[其他]"
+        shop_active_counts[shop] += 1
+
+    adset_meta = aggregate_by_adset(rows)
+    lane_adsets: dict[tuple[str, str], list[AdsetAggregate]] = defaultdict(list)
+    for agg in adset_meta.values():
+        if agg.spend_7d <= 0:
+            continue
+        lane_adsets[(agg.shop, agg.strategy)].append(agg)
+
+    champion_tags_by_pool: dict[tuple[str, str], str] = {}
+
+    for (shop, strategy), members in lane_adsets.items():
+        if shop_active_counts.get(shop, 0) < MIN_ACTIVE_ADS_PER_SHOP:
+            continue
+        y = len(members)
+        if y < MIN_POOL_SIZE:
+            continue
+        sorted_aggs = sorted(
+            members,
+            key=lambda a: (a.weighted_cpc_7d, -a.spend_7d, a.adset_id),
+        )
+        champ_id = sorted_aggs[0].adset_id
+        champ_tj = ""
+        for r in rows:
+            rid = str(r.get("AdSet ID", "") or r.get("廣告ID", "") or "")
+            if rid != champ_id:
+                continue
+            tj = str(r.get("targeting_json", "") or "")
+            if tj:
+                champ_tj = tj
+                break
+        champion_tags_by_pool[(shop, strategy)] = _tags_cached(champ_tj)
+
+    return champion_tags_by_pool
+
+
 def _compute_ad_decisions(
     rows: list[dict],
 ) -> tuple[
@@ -950,9 +1066,55 @@ def _compute_ad_decisions(
         shop_active_counts[shop] += 1
 
     adset_meta = aggregate_by_adset(rows)
+
+    # Deterministic pool hint per adset for occupied-budget deduction:
+    # majority vote by row pool; tie-break by newest row.
+    adset_pool_hint: dict[str, str] = {}
+    adset_pool_counts: dict[str, dict[str, int]] = defaultdict(lambda: {"hk": 0, "bun": 0})
+    adset_pool_newest: dict[str, tuple[str, str]] = {}
+    for idx, r in enumerate(rows):
+        aid = str(r.get("AdSet ID", "") or r.get("廣告ID", "") or f"adset_fallback_{idx}")
+        shop_r = str(r.get("店名", "") or r.get("來源專頁", "") or "").strip() or "[其他]"
+        strategy_r = classify_strategy(
+            str(r.get("廣告名稱", "")),
+            str(r.get("廣告文案", "")),
+            str(r.get("created_time", "")),
+            str(r.get("Campaign Name", "")),
+            shop_r,
+        )
+        pool_r = _pool_name(strategy_r)
+        adset_pool_counts[aid][pool_r] = adset_pool_counts[aid].get(pool_r, 0) + 1
+        ct_raw = str(r.get("created_time", "") or "").strip()
+        if ct_raw:
+            prev = adset_pool_newest.get(aid)
+            if prev is None or ct_raw > prev[0]:
+                adset_pool_newest[aid] = (ct_raw, pool_r)
+    for aid, cnt in adset_pool_counts.items():
+        hk_n = int(cnt.get("hk", 0))
+        bun_n = int(cnt.get("bun", 0))
+        if hk_n > bun_n:
+            adset_pool_hint[aid] = "hk"
+        elif bun_n > hk_n:
+            adset_pool_hint[aid] = "bun"
+        else:
+            adset_pool_hint[aid] = adset_pool_newest.get(aid, ("", "hk"))[1]
+
+    budget_eligible_by_adset: dict[str, bool] = {
+        aid: is_budget_eligible_adset(agg, BUDGET_ELIGIBILITY_MIN_AGE_HOURS)
+        for aid, agg in adset_meta.items()
+    }
+    locked_budget_by_shop_pool: dict[tuple[str, str], float] = defaultdict(float)
+    for aid, agg in adset_meta.items():
+        if budget_eligible_by_adset.get(aid, False):
+            continue
+        locked_pool = adset_pool_hint.get(aid, _pool_name(agg.strategy))
+        locked_budget_by_shop_pool[(agg.shop, locked_pool)] += max(0.0, float(agg.current_budget or 0.0))
+
     lane_adsets: dict[tuple[str, str], list[AdsetAggregate]] = defaultdict(list)
     for agg in adset_meta.values():
         if agg.spend_7d <= 0:
+            continue
+        if not budget_eligible_by_adset.get(agg.adset_id, False):
             continue
         lane_adsets[(agg.shop, agg.strategy)].append(agg)
 
@@ -1027,22 +1189,31 @@ def _compute_ad_decisions(
 
     for shop in items_by_shop:
         items_by_shop[shop] = [
-            x for x in items_by_shop[shop] if x.adset_id not in pause_only_adset_ids
+            x
+            for x in items_by_shop[shop]
+            if x.adset_id not in pause_only_adset_ids and budget_eligible_by_adset.get(x.adset_id, False)
         ]
 
     suggested_by_adset: dict[str, float] = {}
     shop_checks: dict[str, dict] = {}
     for shop, items in items_by_shop.items():
         rb, rh = pending_post_reserves_by_pool(shop)
+        occupied_bun = float(locked_budget_by_shop_pool.get((shop, "bun"), 0.0))
+        occupied_hk = float(locked_budget_by_shop_pool.get((shop, "hk"), 0.0))
         s_map, check = weighted_pool_allocation(
             shop, items, account_min_budget=account_min_budget,
-            reserve_bun=rb, reserve_hk=rh,
+            reserve_bun=rb, reserve_hk=rh, occupied_bun=occupied_bun, occupied_hk=occupied_hk,
         )
         suggested_by_adset.update(s_map)
         shop_checks[shop] = check
 
     for aid in pause_only_adset_ids:
         suggested_by_adset[aid] = 0.0
+    for aid, agg in adset_meta.items():
+        if budget_eligible_by_adset.get(aid, False):
+            continue
+        # Cold-start conservative default: keep current budget and exclude from this allocation round.
+        suggested_by_adset[aid] = max(ENGINE_MIN_DAILY_BUDGET, float(agg.current_budget or 0.0))
 
     seen_budget_adsets: set[str] = set()
 
@@ -1072,7 +1243,12 @@ def _compute_ad_decisions(
         champ_tags = champion_tags_by_pool.get((shop, strategy), "")
 
         pool_limits = effective_pool_limits(shop)
-        class_limit = pool_limits["bun_limit"] if strategy == "BUN" else pool_limits["hk_limit"]
+        sc = shop_checks.get(shop, {})
+        class_limit = (
+            float(sc.get("bun_target", pool_limits["bun_limit"]))
+            if strategy == "BUN"
+            else float(sc.get("hk_target", pool_limits["hk_limit"]))
+        )
         class_spend = today_bun.get(shop, 0.0) if strategy == "BUN" else today_hk.get(shop, 0.0)
         spend_vs_target = f"${class_spend:.0f} / ${class_limit:.0f}"
         suggested_budget = suggested_by_adset.get(
@@ -1119,6 +1295,17 @@ def _compute_ad_decisions(
             priority = "P4"
             cmd = "[指令: NO_ACTION]"
             reason_core = f"🛡️ 樣本不足保護：({shop},{strategy}) 池僅 {pool_n} 支活躍廣告 (< {MIN_POOL_SIZE})，跳過 P0–P2。"
+            new_explore_tags = []
+            ai_json_cell = ""
+        elif not budget_eligible_by_adset.get(adset_id, False):
+            rank_cell = "N/A"
+            band_cell = "N/A (未達預算齡門檻)"
+            priority = "P4"
+            cmd = "[指令: NO_ACTION]"
+            reason_core = (
+                f"🛡️ budget_eligibility=false reason=age_lt_{int(BUDGET_ELIGIBILITY_MIN_AGE_HOURS)}h；"
+                "此廣告組預算先鎖定，暫不參與池內歸一化排序。"
+            )
             new_explore_tags = []
             ai_json_cell = ""
         elif _is_new_ad(created_time):
@@ -1350,9 +1537,17 @@ def _build_action_plan_grid(
             page_for_tpl = norm_meta_graph_id(actor)
             if not page_for_tpl and "_" in pid:
                 page_for_tpl = norm_meta_graph_id(pid.split("_", 1)[0])
+            # P00 executor: native clone + smart routing (post call_to_action GET) in execute_action_plan_new_ads;
+            # messaging template + post without messaging CTA uses proactive safe mode (OUTCOME_ENGAGEMENT + safe DNA).
             p00_template = best_p00_template_adset_id(
                 refined_rows, adset_meta, shop, pool, page_for_tpl
             )
+            if not str(p00_template or "").strip() and page_for_tpl:
+                print(
+                    f"⚠️ best_p00_template_adset_id empty shop={shop} pool={pool} page={page_for_tpl} "
+                    "(no eligible ad set after spend rank, messaging filter, or zero-spend seed; "
+                    "P00 NEW_FROM_POST will skip on execute unless you paste 複製自AdSet ID)"
+                )
             champ = _p00_champion_tags_for_pool(champion_tags_by_pool, shop, pool)
             excl = _audience_exclusion_hint(strategy_for_hint)
             hint_json = _action_plan_audience_hint_json(
@@ -1587,12 +1782,21 @@ def _build_operation_rows_from_decisions(
         cfg = shop_checks.get(shop, {})
         target_gross = float(cfg.get("total_target", suggested_sum))
         reserve = float(cfg.get("new_post_budget_reserve", 0) or 0)
-        deviation = suggested_sum + reserve - target_gross
+        pending_reserve = float(cfg.get("pending_post_budget_reserve", reserve) or 0)
+        occupied_reserve = float(cfg.get("occupied_budget_reserve", 0) or 0)
+        # suggested_sum already includes locked/ineligible adsets via suggested_by_adset defaults.
+        deviation = suggested_sum + pending_reserve - target_gross
         alloc = float(cfg.get("total_allocatable", suggested_sum))
         bun_s = float(cfg.get("bun_suggested", 0) or 0)
         hk_s = float(cfg.get("hk_suggested", 0) or 0)
+        bun_t = float(cfg.get("bun_target", 0) or 0)
+        hk_t = float(cfg.get("hk_target", 0) or 0)
         engine_sum = float(cfg.get("total_suggested", bun_s + hk_s) or 0)
-        extra_reserve = f" | 新貼文預留 ${reserve:.0f}" if reserve > 0.01 else ""
+        extra_reserve = (
+            f" | 新貼文預留 ${pending_reserve:.0f} | 已占用(新廣告) ${occupied_reserve:.0f}"
+            if pending_reserve > 0.01 or occupied_reserve > 0.01
+            else ""
+        )
         mismatch_warn = (
             f" ⚠與分池合 ${engine_sum:.0f} 差>1.5"
             if abs(suggested_sum - engine_sum) > 1.5
@@ -1601,7 +1805,7 @@ def _build_operation_rows_from_decisions(
         cr = [""] * expected_cols
         cr[0] = f"[核對] {shop}"
         cr[9] = (
-            f"廣告組加總 ${suggested_sum:.0f} (BUN ${bun_s:.0f} + HK ${hk_s:.0f}) | "
+            f"廣告組加總 ${suggested_sum:.0f} (BUN ${bun_s:.0f}/{bun_t:.0f} + HK ${hk_s:.0f}/{hk_t:.0f}) | "
             f"可分配 ${alloc:.0f} | 店日總 ${target_gross:.0f}{extra_reserve} | "
             f"偏差(加總+預留-店總) {deviation:+.1f}{mismatch_warn} — "
             f"勿對「📊建議」逐列SUM(同廣告組多列僅首列為金額)"

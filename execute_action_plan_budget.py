@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Execute 💰 預算調整清單: POST ad set daily_budget (minor units); skip CBO ad sets."""
+"""Execute 💰 預算調整清單: POST ad set daily_budget (minor units).
+
+CBO (campaign-budget) rows: budget is applied at the parent ``campaign_id`` via ``daily_budget`` (same minor units).
+"""
 
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ def main() -> None:
         "ok": 0,
         "skipped": 0,
         "failed": 0,
-        "cbo_skipped": 0,
+        "cbo_redirect": 0,
     }
     t0 = time.monotonic()
 
@@ -79,17 +82,56 @@ def main() -> None:
             log.error("auth_failure — abort batch")
             raise SystemExit(1) from None
         camp = aset.get("campaign") or {}
+        camp_id = norm_meta_graph_id(str(camp.get("id") or ""))
         cdb = float(camp.get("daily_budget") or 0)
         adb = float(aset.get("daily_budget") or 0)
-        if cdb > 0 and adb <= 0:
+        is_cbo = cdb > 0 and adb <= 0
+
+        if is_cbo:
+            if not camp_id:
+                log.error(
+                    "section=budget row=%s adset=%s status=fail reason=CBO but campaign id missing",
+                    sr,
+                    adset_id,
+                )
+                stats["failed"] += 1
+                continue
             log.warning(
-                "section=budget row=%s adset=%s status=skip reason=CBO campaign owns budget campaign_id=%s",
+                "section=budget row=%s 🔄 Ad Set %s is CBO. Redirecting budget update to Campaign %s.",
                 sr,
                 adset_id,
-                camp.get("id"),
+                camp_id,
             )
-            stats["cbo_skipped"] += 1
-            stats["skipped"] += 1
+            stats["cbo_redirect"] += 1
+            if dry:
+                log.info(
+                    "section=budget row=%s op=set_campaign_daily_budget campaign=%s minor=%s status=would_execute",
+                    sr,
+                    camp_id,
+                    minor,
+                )
+                stats["would_execute"] += 1
+                continue
+            try:
+                body = client.graph_post(camp_id, {"daily_budget": str(minor)})
+                err = body.get("error") if isinstance(body, dict) else None
+                if isinstance(err, dict):
+                    log.error("section=budget row=%s campaign=%s status=fail", sr, camp_id)
+                    stats["failed"] += 1
+                    continue
+                log.info(
+                    "section=budget row=%s op=set_campaign_daily_budget campaign=%s minor=%s status=ok",
+                    sr,
+                    camp_id,
+                    minor,
+                )
+                stats["ok"] += 1
+            except GraphAuthError:
+                log.error("auth_failure — abort")
+                raise SystemExit(1) from None
+            except Exception as e:
+                log.exception("row=%s err=%s", sr, e)
+                stats["failed"] += 1
             continue
 
         if dry:
@@ -120,14 +162,14 @@ def main() -> None:
 
     elapsed = time.monotonic() - t0
     log.info(
-        "summary rows_total=%s dry_run=%s ok=%s would=%s skipped=%s failed=%s cbo_skipped=%s elapsed_sec=%.2f",
+        "summary rows_total=%s dry_run=%s ok=%s would=%s skipped=%s failed=%s cbo_redirect=%s elapsed_sec=%.2f",
         stats["rows_total"],
         dry,
         stats["ok"],
         stats["would_execute"],
         stats["skipped"],
         stats["failed"],
-        stats["cbo_skipped"],
+        stats["cbo_redirect"],
         elapsed,
     )
     client.close()

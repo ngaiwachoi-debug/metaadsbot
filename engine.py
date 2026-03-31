@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -15,6 +16,7 @@ from meta_utils import norm_meta_graph_id
 load_dotenv()
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
+_logger = logging.getLogger(__name__)
 
 _CONFIG_JSON_CACHE: dict[str, Any] | None = None
 
@@ -493,6 +495,10 @@ class AdsetAggregate:
     weighted_cpc_7d: float
     month_cpc: float
     today_spend: float
+    optimization_goal: str = ""
+    destination_type: str = ""
+    campaign_objective: str = ""
+    representative_created_time: str = ""
 
 
 def aggregate_by_adset(rows: list[dict]) -> dict[str, AdsetAggregate]:
@@ -527,6 +533,24 @@ def aggregate_by_adset(rows: list[dict]) -> dict[str, AdsetAggregate]:
             current_budget = 100.0
         today_spend = sum(_to_float(x.get("今日花費", 0)) for x in bucket)
 
+        optimization_goal = str(first.get("optimization_goal", "") or "").strip()
+        destination_type = str(first.get("destination_type", "") or "").strip()
+        campaign_objective = str(first.get("campaign_objective", "") or "").strip()
+        newest_dt: datetime | None = None
+        newest_raw = ""
+        for x in bucket:
+            raw_ct = str(x.get("created_time", "") or "").strip()
+            if not raw_ct:
+                continue
+            try:
+                dt = datetime.strptime(raw_ct, "%Y-%m-%dT%H:%M:%S%z")
+            except Exception:
+                continue
+            if newest_dt is None or dt > newest_dt:
+                newest_dt = dt
+                newest_raw = raw_ct
+        representative_created_time = newest_raw or str(first.get("created_time", "") or "").strip()
+
         result[adset_id] = AdsetAggregate(
             adset_id=adset_id,
             shop=shop,
@@ -537,12 +561,157 @@ def aggregate_by_adset(rows: list[dict]) -> dict[str, AdsetAggregate]:
             weighted_cpc_7d=max(0.01, weighted_cpc_7d),
             month_cpc=month_cpc,
             today_spend=today_spend,
+            optimization_goal=optimization_goal,
+            destination_type=destination_type,
+            campaign_objective=campaign_objective,
+            representative_created_time=representative_created_time,
         )
     return result
 
 
+def ad_age_hours(created_time: str) -> float | None:
+    """Return ad age in hours, or None when timestamp is missing/invalid."""
+    if not created_time:
+        return None
+    try:
+        dt = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S%z")
+        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def is_budget_eligible_adset(adset: AdsetAggregate, min_age_hours: float = 48.0) -> bool:
+    """Age-only gate for budget ranking/allocation eligibility."""
+    age_h = ad_age_hours(adset.representative_created_time)
+    if age_h is None:
+        return False
+    return age_h >= max(0.0, float(min_age_hours))
+
+
 def _pool_name(strategy: str) -> str:
     return "bun" if strategy == "BUN" else "hk"
+
+
+def _row_matches_pool(row: dict, pool_l: str) -> bool:
+    """
+    Per-ad lane vs pool (``bun`` / ``hk``). Aligns P00 ``pool`` with ``classify_strategy`` on the row,
+    not ``aggregate_by_adset`` strategy (which can mark a whole ad set BUN if any creative is BUN).
+    """
+    shop = str(row.get("店名", "") or row.get("來源專頁", "") or "").strip() or "[其他]"
+    strategy = classify_strategy(
+        str(row.get("廣告名稱", "")),
+        str(row.get("廣告文案", "") or ""),
+        str(row.get("created_time", "")),
+        str(row.get("Campaign Name", "")),
+        shop,
+    )
+    return _pool_name(strategy) == pool_l
+
+
+# Ad set destination_type values that imply messaging / WhatsApp (not suitable as P00 engagement template).
+_MESSAGING_DESTINATION_TYPES: frozenset[str] = frozenset(
+    {
+        "WHATSAPP_MESSAGE",
+        "MESSENGER",
+        "WHATSAPP",
+        "INSTAGRAM_MESSAGE",
+        "MESSAGING_MESSENGER",
+        "INSTAGRAM_DIRECT",
+    }
+)
+
+
+def _is_messaging_template_meta(agg: AdsetAggregate) -> bool:
+    og = (agg.optimization_goal or "").strip().upper()
+    if og == "CONVERSATIONS":
+        return True
+    dt = (agg.destination_type or "").strip().upper()
+    if dt and dt in _MESSAGING_DESTINATION_TYPES:
+        return True
+    return False
+
+
+def _tier1_eligible_p00_template(agg: AdsetAggregate) -> bool:
+    """Non-messaging + (empty campaign objective or OUTCOME_ENGAGEMENT)."""
+    if _is_messaging_template_meta(agg):
+        return False
+    co = (agg.campaign_objective or "").strip()
+    if not co:
+        return True
+    return co == "OUTCOME_ENGAGEMENT"
+
+
+def _tier2_eligible_p00_template(agg: AdsetAggregate) -> bool:
+    """Messaging goals/destinations excluded only (no campaign objective gate)."""
+    return not _is_messaging_template_meta(agg)
+
+
+def _sort_p00_candidates(candidates: list[AdsetAggregate]) -> list[AdsetAggregate]:
+    out = list(candidates)
+    out.sort(key=lambda a: (a.weighted_cpc_7d, -a.spend_7d, a.adset_id))
+    return out
+
+
+def _p00_max_ad_created_time_iso(rows: list[dict], adset_id: str) -> str:
+    """Latest ad ``created_time`` (ISO string) among refined rows for this ad set; empty if unknown."""
+    aid = norm_meta_graph_id(adset_id)
+    if not aid:
+        return ""
+    best = ""
+    for r in rows:
+        rid = norm_meta_graph_id(str(r.get("AdSet ID", "") or ""))
+        if rid != aid:
+            continue
+        ct = str(r.get("created_time", "") or "").strip()
+        if ct and ct > best:
+            best = ct
+    return best
+
+
+def _p00_seed_sort_tuple(rows: list[dict], adset_id: str) -> tuple:
+    """
+    Sort key: prefer rows with a parsed created_time, then lexicographic ISO desc via reverse sort.
+    Tuples (has_ts: int, ts: str, adset_id) — reverse=True puts newest first; unknown time last.
+    """
+    ts = _p00_max_ad_created_time_iso(rows, adset_id)
+    return (1 if ts else 0, ts, adset_id)
+
+
+def _p00_seed_template_adset_id(
+    rows: list[dict],
+    pool_ok: set[str],
+    adset_meta: dict[str, AdsetAggregate],
+) -> str:
+    """
+    When no spend-weighted template works: pick a **zero 7d-spend** ad set on the same page+pool,
+    preferring tier-1 engagement templates, then tier-2 non-messaging; newest ad ``created_time`` wins.
+    **Tier 3:** If only messaging zero-spend sets exist (common for new WhatsApp seed ads), pick the newest
+    anyway — ``execute_action_plan_new_ads`` applies proactive safe / downgrade for post+template mismatch.
+    """
+    zero_aggs: list[AdsetAggregate] = []
+    for adset_id in sorted(pool_ok):
+        agg = adset_meta.get(adset_id)
+        if agg is None or agg.spend_7d > 0:
+            continue
+        zero_aggs.append(agg)
+
+    def _pick(eligible: Callable[[AdsetAggregate], bool]) -> str:
+        elig = [a for a in zero_aggs if eligible(a)]
+        if not elig:
+            return ""
+        elig.sort(key=lambda a: _p00_seed_sort_tuple(rows, a.adset_id), reverse=True)
+        return norm_meta_graph_id(elig[0].adset_id)
+
+    sid = _pick(_tier1_eligible_p00_template)
+    if sid:
+        return sid
+    sid = _pick(_tier2_eligible_p00_template)
+    if sid:
+        return sid
+    if not zero_aggs:
+        return ""
+    zero_aggs.sort(key=lambda a: _p00_seed_sort_tuple(rows, a.adset_id), reverse=True)
+    return norm_meta_graph_id(zero_aggs[0].adset_id)
 
 
 def best_p00_template_adset_id(
@@ -553,23 +722,36 @@ def best_p00_template_adset_id(
     page_actor_id: str,
 ) -> str:
     """
-    Lowest weighted_cpc_7d ad set among rows on the **same Meta page** (row ``actor_id`` or
-    ``instagram_actor_id`` equals ``page_actor_id``) and same **pool** (hk = non-BUN, bun = BUN).
+    Best ad set for P00 native cloning: same Meta page + same pool, lowest weighted_cpc_7d among ad sets
+    with **spend_7d > 0** (non-messaging tiers 1–2).
 
-    Does **not** filter by 店名: multi-page brands must not pick a champion ad set from another
-    page. ``shop`` is unused but kept for call-site clarity.
+    **Pool** matches ``pending_tests`` / ``check_latest_posts``: per **row** ``classify_strategy`` (see
+    ``_row_matches_pool``), not ``AdsetAggregate.strategy`` (aggregate collapses BUN across all ads in set).
 
-    Only ad sets with 7日 aggregate spend_7d > 0 are considered (aligned with lane ranking inputs).
-    Returns "" if no match (callers should not substitute a brand-level config template).
+    **Tier 1:** Excludes messaging (``CONVERSATIONS``, messaging ``destination_type``). If
+    ``campaign_objective`` is present, requires ``OUTCOME_ENGAGEMENT``; if empty (legacy rows), only
+    messaging exclusion applies.
+
+    **Tier 2:** If tier 1 has no candidates, relax the objective gate: exclude messaging only, then
+    lowest CPC.
+
+    **Seed fallback (zero spend):** If no eligible spend>0 template (including when all spend>0 sets are
+    messaging-only), pick the **newest** (by ad ``created_time``) **zero-spend** ad set: tier 1 → tier 2 →
+    tier 3 (messaging allowed) so new seed ads reach the sheet; executor handles messaging DNA safely.
+
+    Does **not** filter by 店名: multi-page brands must not pick from another page. ``shop`` is unused.
+
+    Returns "" if no match.
     """
     _ = shop
     pool_l = str(pool or "hk").lower()
     page_n = norm_meta_graph_id(page_actor_id)
     if not page_n:
+        _logger.warning("best_p00_template_adset_id: empty page_actor_id")
         return ""
 
-    candidates: list[AdsetAggregate] = []
-    seen: set[str] = set()
+    page_row_count = 0
+    pool_ok: set[str] = set()
     for r in rows:
         if "PENDING" in str(r.get("廣告名稱", "") or "").upper():
             continue
@@ -577,23 +759,78 @@ def best_p00_template_adset_id(
         ri = norm_meta_graph_id(r.get("instagram_actor_id", ""))
         if ra != page_n and ri != page_n:
             continue
+        page_row_count += 1
         adset_id = str(r.get("AdSet ID", "") or r.get("廣告ID", "") or "").strip()
         if not adset_id or adset_id.startswith("adset_fallback"):
             continue
+        if not _row_matches_pool(r, pool_l):
+            continue
+        pool_ok.add(adset_id)
+
+    candidates: list[AdsetAggregate] = []
+    for adset_id in sorted(pool_ok):
         agg = adset_meta.get(adset_id)
         if agg is None or agg.spend_7d <= 0:
             continue
-        if _pool_name(agg.strategy) != pool_l:
-            continue
-        if adset_id in seen:
-            continue
-        seen.add(adset_id)
         candidates.append(agg)
 
-    if not candidates:
+    if candidates:
+        tier1 = _sort_p00_candidates([a for a in candidates if _tier1_eligible_p00_template(a)])
+        if tier1:
+            return norm_meta_graph_id(tier1[0].adset_id)
+        tier2 = _sort_p00_candidates([a for a in candidates if _tier2_eligible_p00_template(a)])
+        if tier2:
+            return norm_meta_graph_id(tier2[0].adset_id)
+        seed = _p00_seed_template_adset_id(rows, pool_ok, adset_meta)
+        if seed:
+            _logger.info(
+                "best_p00_template_adset_id: seed_zero_spend page_id=%s pool=%s adset_id=%s "
+                "reason=all_positive_spend_messaging_only",
+                page_n,
+                pool_l,
+                seed,
+            )
+            return seed
+        _logger.warning(
+            "best_p00_template_adset_id: all_messaging_only page_id=%s pool=%s candidate_ids=%s",
+            page_n,
+            pool_l,
+            [a.adset_id for a in candidates],
+        )
         return ""
-    candidates.sort(key=lambda a: (a.weighted_cpc_7d, -a.spend_7d, a.adset_id))
-    return norm_meta_graph_id(candidates[0].adset_id)
+
+    seed = _p00_seed_template_adset_id(rows, pool_ok, adset_meta)
+    if seed:
+        _logger.info(
+            "best_p00_template_adset_id: seed_zero_spend page_id=%s pool=%s adset_id=%s reason=no_positive_spend",
+            page_n,
+            pool_l,
+            seed,
+        )
+        return seed
+
+    if page_row_count == 0:
+        _logger.warning(
+            "best_p00_template_adset_id: no_rows_on_page page_id=%s pool=%s",
+            page_n,
+            pool_l,
+        )
+    elif not pool_ok:
+        _logger.warning(
+            "best_p00_template_adset_id: pool_mismatch page_id=%s pool=%s page_rows=%d "
+            "(no row matched pool via classify_strategy)",
+            page_n,
+            pool_l,
+            page_row_count,
+        )
+    else:
+        _logger.warning(
+            "best_p00_template_adset_id: no_eligible_template_after_seed page_id=%s pool=%s adsets=%s",
+            page_n,
+            pool_l,
+            sorted(pool_ok),
+        )
+    return ""
 
 
 def build_pool_items_by_shop(
@@ -623,19 +860,24 @@ def weighted_pool_allocation(
     account_min_budget: float | None = None,
     reserve_bun: float = 0.0,
     reserve_hk: float = 0.0,
+    occupied_bun: float = 0.0,
+    occupied_hk: float = 0.0,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     """
     AdSet Budget Allocation with Floor Guarantee and tier-aware caps/floors.
     HK pool: LTV AdSets get LTV_BUDGET_WEIGHT on 1/cpc scores.
     Residual fill/trim uses ALLOC_RESIDUAL_TOP_FRACTION.
     Reserves are subtracted from the correct pool target (BUN or HK).
+    ``occupied_*`` is for already-occupied budget (e.g. locked/new adsets) that must be deducted before allocation.
     """
     total, bun_ratio = _shop_config(shop_name)
     rb = max(0.0, _to_float(reserve_bun))
     rh = max(0.0, _to_float(reserve_hk))
-    bun_alloc = max(0.0, total * bun_ratio - rb)
-    hk_alloc = max(0.0, total * (1.0 - bun_ratio) - rh)
-    net_for_single_pool = max(0.0, total - rb - rh)
+    ob = max(0.0, _to_float(occupied_bun))
+    oh = max(0.0, _to_float(occupied_hk))
+    bun_alloc = max(0.0, total * bun_ratio - rb - ob)
+    hk_alloc = max(0.0, total * (1.0 - bun_ratio) - rh - oh)
+    net_for_single_pool = max(0.0, total - rb - rh - ob - oh)
     adset_min_floor = max(
         1.0,
         (_to_float(account_min_budget) + 1.0) if account_min_budget is not None else DEFAULT_ADSET_MIN_FLOOR,
@@ -789,20 +1031,28 @@ def weighted_pool_allocation(
 
     bun_s = sum(suggestions[x.adset_id] for x in by_pool["bun"]) if by_pool["bun"] else 0.0
     hk_s = sum(suggestions[x.adset_id] for x in by_pool["hk"]) if by_pool["hk"] else 0.0
-    reserve_total = rb + rh
+    pending_reserve_total = rb + rh
+    occupied_total = ob + oh
+    reserve_total = pending_reserve_total + occupied_total
     total_allocatable = bun_pool_total + hk_pool_total
     check: dict[str, Any] = {
         "bun_suggested": bun_s,
         "bun_target": bun_pool_total,
+        "bun_target_gross": total * bun_ratio,
         "hk_suggested": hk_s,
         "hk_target": hk_pool_total,
+        "hk_target_gross": total * (1.0 - bun_ratio),
         "total_suggested": bun_s + hk_s,
         "total_target": total,
         "total_target_before_reserve": total,
         "total_allocatable": total_allocatable,
         "new_post_budget_reserve": reserve_total,
+        "pending_post_budget_reserve": pending_reserve_total,
+        "occupied_budget_reserve": occupied_total,
         "reserve_bun": rb,
         "reserve_hk": rh,
+        "occupied_bun": ob,
+        "occupied_hk": oh,
         "adset_min_floor": adset_min_floor,
         "bun_underfunded_warning": bun_under,
         "hk_underfunded_warning": hk_under,

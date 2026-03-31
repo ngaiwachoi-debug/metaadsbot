@@ -20,8 +20,8 @@ UNMAPPED_LABEL = "Unmapped"
 def _ads_fields(insights_f: str) -> str:
     return (
         f"id,name,created_time,"
-        f"adset{{id,name,daily_budget}},"
-        f"campaign{{id,name,daily_budget}},"
+        f"adset{{id,name,daily_budget,optimization_goal,destination_type}},"
+        f"campaign{{id,name,daily_budget,objective}},"
         f"creative{{id,actor_id,instagram_actor_id,body,effective_object_story_id}},"
         f"targeting,{insights_f}"
     )
@@ -175,7 +175,45 @@ async def get_range_raw_data(client, label: str, since: str, until: str):
         all_ads.extend(filtered_batch)
         current_url = data.get("paging", {}).get("next")
         current_params = None
-    print(f"📦 {label}: 抓取 {len(all_ads)} 則 ACTIVE + spend>0 廣告")
+        print(f"📦 {label}: 抓取 {len(all_ads)} 則 ACTIVE + spend>0 廣告")
+    return all_ads
+
+
+# Include PAUSED / PENDING_REVIEW so zero-spend & in-review ads reach Refined for P00 seed template selection.
+_SUPPLEMENTAL_AD_EFFECTIVE_STATUSES = ["ACTIVE", "PAUSED", "PENDING_REVIEW", "PREAPPROVED"]
+
+
+async def get_supplemental_ads_for_refined_seed(client, since: str, until: str) -> list:
+    """
+    Paginate ads with spend>0 gate **disabled** (and broader effective_status) so new seed templates
+    and ``處理中`` ads still produce Raw/Refined rows. Merged after the four spend-weighted pulls.
+    """
+    url = f"https://graph.facebook.com/v18.0/{AD_ACCOUNT_ID}/ads"
+    insights_f = f"insights.time_range({{'since':'{since}','until':'{until}'}}){{spend,cpc,clicks}}"
+    params = {
+        "fields": _ads_fields(insights_f),
+        "filtering": json.dumps(
+            [{"field": "ad.effective_status", "operator": "IN", "value": _SUPPLEMENTAL_AD_EFFECTIVE_STATUSES}]
+        ),
+        "access_token": ACCESS_TOKEN,
+        "limit": ADS_PAGE_LIMIT,
+    }
+    all_ads: list = []
+    current_url = url
+    current_params = params
+    while current_url:
+        res = await client.get(current_url, params=current_params, timeout=HTTP_TIMEOUT)
+        res.raise_for_status()
+        data = res.json()
+        batch_data = data.get("data", [])
+        for ad in batch_data:
+            all_ads.append(ad)
+        current_url = data.get("paging", {}).get("next")
+        current_params = None
+    print(
+        f"📦 supplemental_seed: 抓取 {len(all_ads)} 則 "
+        f"(effective_status in {len(_SUPPLEMENTAL_AD_EFFECTIVE_STATUSES)} states, 含0花費)"
+    )
     return all_ads
 
 
@@ -220,6 +258,9 @@ def process_batch(data_list, key_prefix: str, report: dict, merged_ads: dict, sy
             adset_name = str(adset_obj.get("name", "") or "")
             adset_minor = to_float_minor(adset_obj.get("daily_budget", None))
             campaign_minor = to_float_minor(campaign_obj.get("daily_budget", 0))
+            optimization_goal = str(adset_obj.get("optimization_goal") or "").strip()
+            destination_type = str(adset_obj.get("destination_type") or "").strip()
+            campaign_objective = str(campaign_obj.get("objective") or "").strip()
             cbo = adset_minor <= 0 and campaign_minor > 0
             adset_api_minor = 0.0
 
@@ -238,6 +279,9 @@ def process_batch(data_list, key_prefix: str, report: dict, merged_ads: dict, sy
                 "adset_name": adset_name,
                 "campaign_id": str(campaign_obj.get("id", "") or ""),
                 "campaign_name": str(campaign_obj.get("name", "") or ""),
+                "optimization_goal": optimization_goal,
+                "destination_type": destination_type,
+                "campaign_objective": campaign_objective,
                 "adset_daily_budget_minor": adset_minor,
                 "campaign_daily_budget_minor": campaign_minor,
                 "adset_daily_budget_api_minor": adset_api_minor,
@@ -275,25 +319,30 @@ async def run_sync_process():
     synced_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         account_min_minor, account_currency = await get_account_min_budget_minor(client)
-        print("📡 正在抓取四個時間維度數據: today / last_7d / last_30d / this_month")
+        print("📡 正在抓取四個時間維度數據: today / last_7d / last_30d / this_month + supplemental_seed")
         try:
-            t_raw, d7_raw, d30_raw, m_raw = await asyncio.gather(
+            t_raw, d7_raw, d30_raw, m_raw, sup_raw = await asyncio.gather(
                 get_range_raw_data(client, "today", ranges["today"]["since"], ranges["today"]["until"]),
                 get_range_raw_data(client, "last_7d", ranges["last_7d"]["since"], ranges["last_7d"]["until"]),
                 get_range_raw_data(client, "last_30d", ranges["last_30d"]["since"], ranges["last_30d"]["until"]),
                 get_range_raw_data(client, "this_month", ranges["this_month"]["since"], ranges["this_month"]["until"]),
+                get_supplemental_ads_for_refined_seed(
+                    client, ranges["last_7d"]["since"], ranges["today"]["until"]
+                ),
             )
         except Exception as e:
             print(f"❌ 抓取 Meta 數據失敗: {e}")
             return
 
-        merged_ads = _merge_ads_for_richest_creative(t_raw, d7_raw, d30_raw, m_raw)
+        merged_ads = _merge_ads_for_richest_creative(t_raw, d7_raw, d30_raw, m_raw, sup_raw)
         report: dict = {}
 
         process_batch(t_raw, "today", report, merged_ads, synced_at, account_min_minor, account_currency)
         process_batch(d7_raw, "last_7d", report, merged_ads, synced_at, account_min_minor, account_currency)
         process_batch(d30_raw, "last_30d", report, merged_ads, synced_at, account_min_minor, account_currency)
         process_batch(m_raw, "this_month", report, merged_ads, synced_at, account_min_minor, account_currency)
+        # Zero-spend / in-review ads only appear in sup_raw — attribute 7d metrics from that pull.
+        process_batch(sup_raw, "last_7d", report, merged_ads, synced_at, account_min_minor, account_currency)
 
         header = [
             "synced_at",
@@ -305,6 +354,9 @@ async def run_sync_process():
             "AdSet Name",
             "Campaign ID",
             "Campaign Name",
+            "optimization_goal",
+            "destination_type",
+            "campaign_objective",
             "adset_daily_budget_minor",
             "campaign_daily_budget_minor",
             "adset_daily_budget_api_minor",
@@ -339,6 +391,9 @@ async def run_sync_process():
                     d.get("adset_name", ""),
                     d.get("campaign_id", ""),
                     d.get("campaign_name", ""),
+                    d.get("optimization_goal", ""),
+                    d.get("destination_type", ""),
+                    d.get("campaign_objective", ""),
                     d.get("adset_daily_budget_minor", 0),
                     d.get("campaign_daily_budget_minor", 0),
                     d.get("adset_daily_budget_api_minor", 0),
@@ -364,9 +419,8 @@ async def run_sync_process():
         total_today = sum(v.get("today_spend", 0) for v in report.values())
         total_month = sum(v.get("this_month_spend", 0) for v in report.values())
         sheet_output.append([])
-        sheet_output.append(
-            ["總消耗統計", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", f"today: {total_today:.2f}", f"this_month: {total_month:.2f}"]
-        )
+        stats_row = ["總消耗統計"] + [""] * (len(header) - 3) + [f"today: {total_today:.2f}", f"this_month: {total_month:.2f}"]
+        sheet_output.append(stats_row)
 
         print(f"☁️ 正在同步 Raw 到 Google Sheets: {SHEET_NAME} / {RAW_SHEET_TAB} ...")
         try:

@@ -18,8 +18,8 @@
       "533512276514917": "其他"
     },
     "SHOP_CONFIGS": {
-      "OLase 金帝行店": {"total": 700,"bun_ratio": 0.3}
-    },
+      "Olase 旺角店": {"total": 700, "bun_ratio": 0.0}
+        },
     "STRATEGY_TARGET_CPC": {"LTV": 35.0, "BUN": 1.5, "GENERAL": 18.0, "NEW": 20.0},
     "LTV_KEYWORDS": "Gentlelase,755,脫毛,12個月,永久,激光,毛髮",
     "NEW_AD_PROTECTION_HOURS": 72,
